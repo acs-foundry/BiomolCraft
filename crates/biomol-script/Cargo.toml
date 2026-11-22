@@ -1,0 +1,22 @@
+[package]
+name = "biomol-script"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "PyMOL/ChimeraX-compatible command DSL, transactional Undo/Redo biomolecular session, provenance evidence log, and headless render/script runner"
+
+[lints]
+workspace = true
+
+[dependencies]
+biomol-model.workspace = true
+biomol-modules.workspace = true
+biomol-rna.workspace = true
+craftbio-scene.workspace = true
+craftbio-struct.workspace = true
+craftbio-viewport.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

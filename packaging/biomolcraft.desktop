@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=BiomolCraft
+GenericName=Biomolecular 3D Visualization & Modeling Studio
+Comment=Pure-Rust wgpu 3D Biomolecular Studio, Modeling, ncRNA/mRNA & Modular Biologics Suite
+Exec=biomolcraft
+Icon=biomolcraft
+Terminal=false
+Categories=Science;Biology;Chemistry;
+StartupWMClass=BiomolCraft

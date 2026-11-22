@@ -1,0 +1,24 @@
+[package]
+name = "biomolcraft-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Headless CLI, Craft Link v1 client, and storytold/craft-mcp-server MCP endpoint for BiomolCraft"
+
+[lints]
+workspace = true
+
+[dependencies]
+biomol-model.workspace = true
+biomol-modules.workspace = true
+biomol-rna.workspace = true
+biomol-script.workspace = true
+clap.workspace = true
+craft-mcp-server.workspace = true
+craftbio-sandbox.workspace = true
+craftbio-scene.workspace = true
+craftbio-struct.workspace = true
+craftbio-viewport.workspace = true
+serde_json.workspace = true

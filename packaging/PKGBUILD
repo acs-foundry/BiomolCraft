@@ -1,0 +1,22 @@
+# Maintainer: acs-foundry
+pkgname=biomolcraft
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Pure-Rust Biomolecular 3D Studio, Modeling, ncRNA/mRNA & Modular Biologics Suite (CraftBio)"
+arch=('x86_64')
+url="https://github.com/acs-foundry/BiomolCraft"
+license=('MIT' 'Apache-2.0')
+depends=('gcc-libs' 'glibc' 'libx11' 'libxcb' 'libxkbcommon' 'wayland' 'mesa' 'vulkan-icd-loader')
+makedepends=('cargo' 'rust')
+
+build() {
+  cargo build --release --locked --workspace
+}
+
+package() {
+  install -Dm755 target/release/biomolcraft "$pkgdir/usr/bin/biomolcraft"
+  install -Dm755 target/release/biomolcraft-cli "$pkgdir/usr/bin/biomolcraft-cli"
+  install -Dm644 packaging/biomolcraft.desktop "$pkgdir/usr/share/applications/biomolcraft.desktop"
+  install -Dm644 packaging/biomolcraft.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/biomolcraft.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,0 +1,17 @@
+[package]
+name = "biomol-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Interactive 3D biomolecular mutagenesis (Dunbrack rotamers + clash detection), local MM energy minimization (ISOLDE-lite), and structure prep audit"
+
+[lints]
+workspace = true
+
+[dependencies]
+craftbio-scene.workspace = true
+craftbio-struct.workspace = true
+serde.workspace = true
+thiserror.workspace = true

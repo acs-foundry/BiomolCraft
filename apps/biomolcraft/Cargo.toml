@@ -1,0 +1,23 @@
+[package]
+name = "biomolcraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "BiomolCraft: Pure-Rust wgpu 3D Biomolecular Visualization, Interactive Modeling, Physics & Modular Design Studio (CraftBio Flagship)"
+
+[lints]
+workspace = true
+
+[dependencies]
+biomol-model.workspace = true
+biomol-modules.workspace = true
+biomol-rna.workspace = true
+biomol-script.workspace = true
+craftbio-scene.workspace = true
+craftbio-struct.workspace = true
+craftbio-viewport.workspace = true
+eframe.workspace = true
+egui.workspace = true
+serde_json.workspace = true

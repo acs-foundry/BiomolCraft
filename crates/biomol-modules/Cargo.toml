@@ -1,0 +1,22 @@
+[package]
+name = "biomol-modules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Schrodinger/BioLuminate & Craft-Anything style pluggable biomolecular module registry (Antibodies/VHH, ncRNA/mRNA, Enzymes, ADCs, Biologics PK/TMDD)"
+
+[lints]
+workspace = true
+
+[dependencies]
+bio-adc.workspace = true
+bio-core.workspace = true
+bio-develop.workspace = true
+bio-engine.workspace = true
+bio-interface.workspace = true
+biomol-rna.workspace = true
+craftbio-scene.workspace = true
+craftbio-struct.workspace = true
+serde.workspace = true
