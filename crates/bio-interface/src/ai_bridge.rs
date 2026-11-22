@@ -123,9 +123,9 @@ pub fn stage_denovo_binder(req: &DeNovoRequest) -> DeNovoStagePlan {
 import json, subprocess, sys\n\
 from pathlib import Path\n\
 \n\
-# 1. Rank MPNN FASTA sequences with BioCraft deterministic TAP + immunogenicity first (zero GPU cost):\n\
+# 1. Rank MPNN FASTA sequences with BiomolCraft deterministic TAP + immunogenicity first (zero GPU cost):\n\
 fasta = Path(\"out_{name}/mpnn/seqs/design_0.fa\")\n\
-print(\"Step 1: Run `biocraft-cli develop --fasta\", fasta, \"--json` to eliminate TAP/PTM/MHC-II liabilities.\")\n\
+print(\"Step 1: Run `biomolcraft-cli module --name antibodies --pdb <design.pdb>` to eliminate TAP/PTM/MHC-II liabilities.\")\n\
 print(\"Step 2: Optional ESM2-650M masked marginal scoring (requires `fair-esm` + PyTorch on RTX 4080).\")\n",
         name = req.campaign_name
     );
@@ -142,8 +142,8 @@ print(\"Step 2: Optional ESM2-650M masked marginal scoring (requires `fair-esm` 
 
     let go_nogo_gates = vec![
         "Gate 1 (Co-folding confidence): Boltz-2 / Chai-1 interface `ipTM >= 0.75`, binder `pLDDT >= 80`, interface `PAE <= 8.0 Å`, backbone `RMSD_design <= 2.0 Å`.".to_string(),
-        "Gate 2 (BioCraft 3D Interface): `ΔBSA >= 650 Å²`, `>= 4` H-bonds/salt-bridges, zero steric clashes, confirmed epitope overlap with intended hotspots.".to_string(),
-        "Gate 3 (BioCraft TAP & Immunogenicity): Zero Red TAP flags, `max 3D SAP < 0.85`, zero unpaired Cys, low non-self HLA-DRB1 burden.".to_string(),
+        "Gate 2 (BiomolCraft 3D Interface): `ΔBSA >= 650 Å²`, `>= 4` H-bonds/salt-bridges, zero steric clashes, confirmed epitope overlap with intended hotspots.".to_string(),
+        "Gate 3 (BiomolCraft TAP & Immunogenicity): Zero Red TAP flags, `max 3D SAP < 0.85`, zero unpaired Cys, low non-self HLA-DRB1 burden.".to_string(),
         "Gate 4 (Scientific Integrity): In-silico designs are hypotheses only — NEVER treat high ipTM/pLDDT as proof of experimental affinity without wet-lab SPR/BLI.".to_string(),
     ];
 

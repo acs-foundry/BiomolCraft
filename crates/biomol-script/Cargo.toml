@@ -16,6 +16,7 @@ biomol-model.workspace = true
 biomol-modules.workspace = true
 biomol-physics.workspace = true
 biomol-rna.workspace = true
+craftbio-report.workspace = true
 craftbio-scene.workspace = true
 craftbio-struct.workspace = true
 craftbio-viewport.workspace = true

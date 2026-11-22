@@ -19,6 +19,7 @@ biomol-rna.workspace = true
 biomol-script.workspace = true
 clap.workspace = true
 craft-mcp-server.workspace = true
+craftbio-report.workspace = true
 craftbio-sandbox.workspace = true
 craftbio-scene.workspace = true
 craftbio-struct.workspace = true

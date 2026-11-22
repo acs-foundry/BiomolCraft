@@ -12,8 +12,9 @@ use biomol_model::{
     audit_structure_prep, minimize_local_mm, mutate_and_repack_best_rotamer, mutate_residue_3d,
 };
 use biomol_modules::{
-    run_adc_module, run_antibody_module, run_enzyme_engineering_module, run_enzyme_module,
-    run_ncrna_module, run_physics_anm_module, run_physics_gbsa_module,
+    discover_installed_plugins, run_adc_module, run_antibody_module, run_cryoem_molmap_module,
+    run_cryoem_volume_module, run_denovo_cofold_module, run_enzyme_engineering_module,
+    run_enzyme_module, run_ncrna_module, run_physics_anm_module, run_physics_gbsa_module,
 };
 use biomol_physics::{
     OpenMmBiomolConfig, check_openmm_biomol_env, check_xtb_env, compute_gbsa_energy,
@@ -24,15 +25,17 @@ use biomol_rna::{
 };
 use biomol_script::BiomolSession;
 use clap::{Parser, Subcommand};
-use craftbio_sandbox::{DEFAULT_MAX_FILE_BYTES, PathSandbox};
+use craftbio_report::{export_artcraft_bundle, write_biomol_html_dossier};
+use craftbio_sandbox::{DEFAULT_MAX_FILE_BYTES, PathSandbox, inspect_wasm_plugin};
 use craftbio_scene::{
     CraftSceneDocument, discover_craft_instances, push_scene_via_craft_link,
     send_dsl_via_craft_link, send_trajectory_via_craft_link,
 };
 use craftbio_struct::{
-    load_dcd_frames, matchmaker_align, parse_structure_auto, write_multi_model_pdb, write_pdb,
+    load_dcd_frames, matchmaker_align, parse_dx_map, parse_mrc_map, parse_structure_auto,
+    write_mrc_map, write_multi_model_pdb, write_pdb,
 };
-use craftbio_viewport::write_scene_png;
+use craftbio_viewport::{render_scene_png_bytes, write_scene_png};
 
 #[derive(Parser)]
 #[command(
@@ -221,6 +224,68 @@ enum Commands {
     },
     /// Probe local Tier-2 GPU Physics engines (OpenMM CUDA/OpenCL/CPU & GFN2-xTB).
     PhysicsEnv,
+    /// Cryo-EM MRC2014 / OpenDX Volumetric Maps: synthesize `molmap`, open `.mrc`/`.dx`, `fitmap`, and render 3D density contour PNG.
+    Cryoem {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long)]
+        map: Option<PathBuf>,
+        #[arg(long, default_value_t = 4.5)]
+        molmap_res: f64,
+        #[arg(long, default_value_t = 1.5)]
+        sigma: f64,
+        #[arg(long)]
+        fit: bool,
+        #[arg(long)]
+        out_mrc: Option<PathBuf>,
+        #[arg(long)]
+        out_md: Option<PathBuf>,
+        #[arg(long)]
+        out_png: Option<PathBuf>,
+    },
+    /// Stage a zero-weight De Novo & Co-Fold (`RFdiffusion` + `ProteinMPNN` + `ESM2` + `Boltz-2/Chai-1`) binder campaign from 3D hotspots.
+    Denovo {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long, default_value_t = 'C')]
+        chain: char,
+        #[arg(long, help = "Comma-separated hotspot residues, e.g. 'C558,C560,C573'")]
+        hotspots: Option<String>,
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        #[arg(long)]
+        out_png: Option<PathBuf>,
+    },
+    /// Export a single-file offline-Mol* 3D interactive HTML biomolecular dossier.
+    ExportHtml {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(
+            long,
+            help = "Optional module to run before export: antibodies|ncrna|enzymes|adc|gbsa"
+        )]
+        module: Option<String>,
+        #[arg(long)]
+        out_html: PathBuf,
+        #[arg(long, default_value_t = true)]
+        offline: bool,
+    },
+    /// Export an ArtCraft publication bundle (1600x1200 PNG + GridCraft TSV + WordCraft/DeckCraft Markdown).
+    ExportArtcraft {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long)]
+        module: Option<String>,
+        #[arg(long)]
+        out_dir: PathBuf,
+    },
+    /// Inspect a `.wasm` plugin safely (never executes code) or list installed `$CRAFT_DATA_DIR/plugins`.
+    PluginInspect {
+        #[arg(long)]
+        wasm: Option<PathBuf>,
+        #[arg(long)]
+        list: bool,
+    },
     /// Discover running CraftBio/ArtCraft apps via Craft Link v1 (`craft-ipc`) and optionally push a PDB/DCD/DSL command.
     Link {
         #[arg(long, default_value = "biomolcraft")]
@@ -718,6 +783,189 @@ fn run() -> Result<(), String> {
                 }))
                 .map_err(|e| e.to_string())?
             );
+        }
+        Commands::Cryoem {
+            pdb,
+            map,
+            molmap_res,
+            sigma,
+            fit,
+            out_mrc,
+            out_md,
+            out_png,
+        } => {
+            let mut sess = BiomolSession::default();
+            sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+            let (vis, grid) = if let Some(mp) = map {
+                let g = if mp
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("dx"))
+                {
+                    let txt = std::fs::read_to_string(&mp).map_err(|e| e.to_string())?;
+                    parse_dx_map(&mp.display().to_string(), &txt).map_err(|e| e.to_string())?
+                } else {
+                    let bytes = std::fs::read(&mp).map_err(|e| e.to_string())?;
+                    parse_mrc_map(&mp.display().to_string(), &bytes).map_err(|e| e.to_string())?
+                };
+                let mol = sess.molecule.as_mut().ok_or("no molecule")?;
+                let (v, _) = run_cryoem_volume_module(mol, &g, sigma, fit);
+                (v, g)
+            } else {
+                let mol = sess.molecule.as_mut().ok_or("no molecule")?;
+                let (v, g, _) = run_cryoem_molmap_module(mol, molmap_res, sigma)?;
+                (v, g)
+            };
+            if let Some(p) = out_mrc {
+                if let Some(parent) = p.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&p, write_mrc_map(&grid)).map_err(|e| e.to_string())?;
+            }
+            if let Some(p) = out_md {
+                write_text(&p, &vis.summary_markdown)?;
+            }
+            if let Some(p) = out_png {
+                sess.render_opts.sphere_overlays = vis.sphere_overlays;
+                sess.dirty_geometry = true;
+                let sc = sess.build_viewport_scene();
+                let bytes = write_scene_png(&sc, &sess.camera, 1600, 1200, false, &p)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "Rendered Cryo-EM volumetric PNG to {} ({bytes} bytes).",
+                    p.display()
+                );
+            }
+            print!("{}", vis.summary_markdown);
+        }
+        Commands::Denovo {
+            pdb,
+            chain,
+            hotspots,
+            out_dir,
+            out_png,
+        } => {
+            let mut sess = BiomolSession::default();
+            sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+            let hs: Vec<String> = hotspots
+                .unwrap_or_default()
+                .split([',', ' ', ';'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            let mol = sess.molecule.as_ref().ok_or("no molecule")?;
+            let (vis, _) = run_denovo_cofold_module(mol, chain, &hs, out_dir.as_deref())?;
+            if let Some(p) = out_png {
+                sess.render_opts.residue_highlights = vis.residue_highlights;
+                sess.render_opts.sphere_overlays = vis.sphere_overlays;
+                sess.dirty_geometry = true;
+                let sc = sess.build_viewport_scene();
+                let bytes = write_scene_png(&sc, &sess.camera, 1600, 1200, false, &p)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "Rendered De Novo hotspots PNG to {} ({bytes} bytes).",
+                    p.display()
+                );
+            }
+            print!("{}", vis.summary_markdown);
+        }
+        Commands::ExportHtml {
+            pdb,
+            module,
+            out_html,
+            offline,
+        } => {
+            let mut sess = BiomolSession::default();
+            sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+            let mut extra_svg: Option<String> = None;
+            if let Some(m) = module {
+                if m.eq_ignore_ascii_case("gbsa") {
+                    let _ = sess.execute_dsl("gbsa").map_err(|e| e.to_string())?;
+                } else {
+                    let _ = sess
+                        .execute_dsl(&format!("module {m}"))
+                        .map_err(|e| e.to_string())?;
+                    if m.eq_ignore_ascii_case("ncrna")
+                        && let Some(ref mol) = sess.molecule
+                        && let Ok((_, reps)) = run_ncrna_module(mol)
+                        && let Some(first) = reps.first()
+                    {
+                        extra_svg = Some(render_rna_arc_svg(&first.name, &first.fold));
+                    }
+                }
+            }
+            let mol = sess.molecule.as_ref().ok_or("no molecule")?;
+            let mut svgs = Vec::new();
+            if let Some(ref s) = extra_svg {
+                svgs.push(("ncRNA Base-Pair Arc Diagram", s.as_str()));
+            }
+            let sum = write_biomol_html_dossier(
+                &mol.title,
+                &write_pdb(mol),
+                &sess.last_module_markdown,
+                &svgs,
+                offline,
+                &out_html,
+            )?;
+            println!(
+                "Wrote BiomolCraft interactive 3D HTML dossier: {} ({} bytes, molstar_inline_offline={})",
+                sum.out_path, sum.bytes, sum.molstar_inline_offline
+            );
+        }
+        Commands::ExportArtcraft {
+            pdb,
+            module,
+            out_dir,
+        } => {
+            let mut sess = BiomolSession::default();
+            sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+            if let Some(m) = module {
+                let _ = sess
+                    .execute_dsl(&format!("module {m}"))
+                    .map_err(|e| e.to_string())?;
+            }
+            let title = sess
+                .molecule
+                .as_ref()
+                .map_or_else(|| "BiomolCraft".to_string(), |m| m.title.clone());
+            let atoms = sess.molecule.as_ref().map_or(0, |m| m.atoms.len());
+            let chains = sess.molecule.as_ref().map_or(0, |m| m.chains.len());
+            let sc = sess.build_viewport_scene();
+            let png = render_scene_png_bytes(&sc, &sess.camera, 1600, 1200, false)
+                .map_err(|e| e.to_string())?;
+            let rows = vec![
+                ("Structure", title.clone()),
+                ("Atoms", atoms.to_string()),
+                ("Chains", chains.to_string()),
+                ("Provenance Entries", sess.provenance.len().to_string()),
+            ];
+            let sum =
+                export_artcraft_bundle(&title, &png, &rows, &sess.last_module_markdown, &out_dir)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&sum).map_err(|e| e.to_string())?
+            );
+        }
+        Commands::PluginInspect { wasm, list } => {
+            if let Some(wp) = wasm {
+                let bytes = std::fs::read(&wp).map_err(|e| e.to_string())?;
+                let rep = inspect_wasm_plugin(&bytes).map_err(|e| e.to_string())?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rep).map_err(|e| e.to_string())?
+                );
+            } else if list {
+                let plugs = discover_installed_plugins();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&plugs).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("Pass --wasm <plugin.wasm> or --list.");
+            }
         }
         Commands::Link {
             app,

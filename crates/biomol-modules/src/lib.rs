@@ -16,8 +16,8 @@ use bio_core::{IgChainType, RegionKind, annotate_chain, parse_pdb as parse_bio_p
 use bio_develop::{DevelopabilityReport, evaluate_developability, render_developability_markdown};
 use bio_engine::audit_payload_with_admetcraft;
 use bio_interface::{
-    AlaScanReport, InterfaceReport, analyze_ppi_interface, render_interface_markdown,
-    run_alanine_scan,
+    AlaScanReport, DeNovoRequest, DeNovoStagePlan, InterfaceReport, analyze_ppi_interface,
+    render_denovo_markdown, render_interface_markdown, run_alanine_scan, stage_denovo_binder,
 };
 use biomol_enzyme::{
     EnzymeEngineeringReport, analyze_enzyme_engineering, enzyme_visual_overlays,
@@ -28,10 +28,15 @@ use biomol_physics::{
     generate_anm_trajectory_frames, render_anm_markdown, render_gbsa_markdown,
 };
 use biomol_rna::{NcRnaAnalysisReport, analyze_ncrna_mrna, render_rna_markdown};
+use craftbio_report::craft_data_dir;
+use craftbio_sandbox::{WasmPluginReport, inspect_wasm_plugin};
 use craftbio_scene::{
     ColorScheme, LineOverlay, ProvenanceEntry, ProvenanceKind, RepresentationKind, SphereOverlay,
 };
-use craftbio_struct::{Biomolecule, ResidueClass, compute_sasa, write_pdb};
+use craftbio_struct::{
+    Biomolecule, MapFitReport, ResidueClass, VolumeGrid3D, compute_sasa, extract_isosurface_nodes,
+    fit_model_in_map, simulate_cryoem_map, write_pdb,
+};
 use serde::{Deserialize, Serialize};
 
 /// First-class loadable biomolecular module identifiers inside `BiomolCraft`.
@@ -599,4 +604,263 @@ pub fn run_pk_tmdd_module(
     let rep = simulate_biologics_pk_tmdd(&req).map_err(|e| e.to_string())?;
     let md = render_biopk_markdown(&rep);
     Ok((rep, md))
+}
+
+/// Synthesize a Cryo-EM volumetric electron density map (`molmap`) and project translucent
+/// contour isosurface beads directly onto the 3D scene (`craftbio-viewport`).
+pub fn run_cryoem_molmap_module(
+    mol: &mut Biomolecule,
+    resolution_a: f64,
+    sigma_level: f64,
+) -> Result<(ModuleExecutionOutput, VolumeGrid3D, MapFitReport), String> {
+    let grid = simulate_cryoem_map(mol, resolution_a, 1.5).map_err(|e| e.to_string())?;
+    let (vis, fit) = run_cryoem_volume_module(mol, &grid, sigma_level, false);
+    Ok((vis, grid, fit))
+}
+
+/// Render an external or synthesized `VolumeGrid3D` (`.mrc`/`.map`/`.dx`) isosurface contour
+/// and evaluate / optimize rigid `fitmap` cross-correlation against `mol`.
+#[must_use]
+pub fn run_cryoem_volume_module(
+    mol: &mut Biomolecule,
+    grid: &VolumeGrid3D,
+    sigma_level: f64,
+    optimize_fit: bool,
+) -> (ModuleExecutionOutput, MapFitReport) {
+    let fit = fit_model_in_map(mol, grid, if optimize_fit { 16 } else { 0 });
+    let iso = extract_isosurface_nodes(grid, sigma_level, 1400);
+    let spheres: Vec<SphereOverlay> = iso
+        .into_iter()
+        .map(|(pt, rad)| SphereOverlay {
+            label: format!("{} ({sigma_level:.1}σ)", grid.label),
+            category: "Cryo-EM Density".to_string(),
+            coords: pt,
+            radius_a: rad,
+            rgba: [0.42, 0.78, 0.98, 0.24],
+        })
+        .collect();
+    let mut md = String::new();
+    let _ = writeln!(md, "# Cryo-EM & Volumetric Map Audit: {}\n", grid.label);
+    let _ = writeln!(
+        md,
+        "- **Grid Dimensions:** `{} × {} × {}` | **Voxel Size:** `{:.2} Å` | **Contour:** `{sigma_level:.2} σ` (`{} surface beads`)",
+        grid.dims[0],
+        grid.dims[1],
+        grid.dims[2],
+        grid.voxel_size[0],
+        spheres.len()
+    );
+    let _ = writeln!(
+        md,
+        "- **Map-to-Model Correlation (`fitmap`):** **`{:.3} → {:.3}`** (`{} atoms`, mean density `{:.2} σ`, **`{:.1}%`** inside `>= 1.0 σ`)",
+        fit.correlation_before,
+        fit.correlation_after,
+        fit.atoms_evaluated,
+        fit.mean_density_sigma,
+        fit.atoms_inside_1sigma_pct
+    );
+    let _ = writeln!(
+        md,
+        "- **Rigid Translation Applied:** `[{:.2}, {:.2}, {:.2}] Å`",
+        fit.translation_applied_a[0], fit.translation_applied_a[1], fit.translation_applied_a[2]
+    );
+    let vis = ModuleExecutionOutput {
+        module_name: "Cryo-EM & Volumetric Maps".to_string(),
+        recommended_repr: Some(RepresentationKind::Cartoon),
+        recommended_color: Some(ColorScheme::Chain),
+        residue_highlights: HashMap::new(),
+        sphere_overlays: spheres,
+        line_overlays: Vec::new(),
+        summary_markdown: md,
+        provenance: vec![ProvenanceEntry {
+            kind: ProvenanceKind::ComputationalPrediction,
+            source_app: "biomolcraft::cryoem-volume".to_string(),
+            summary: format!(
+                "Volumetric map '{}' at {:.1}σ: fitmap CC={:.3}, {:.1}% atoms >= 1σ.",
+                grid.label, sigma_level, fit.correlation_after, fit.atoms_inside_1sigma_pct
+            ),
+        }],
+    };
+    (vis, fit)
+}
+
+/// Stage a zero-weight **De Novo & Co-Fold** (`RFdiffusion` + `ProteinMPNN` + `ESM2` + `Boltz-2/Chai-1`)
+/// binder campaign directly from 3D epitope hotspot residues on `target_chain`.
+pub fn run_denovo_cofold_module(
+    mol: &Biomolecule,
+    target_chain: char,
+    hotspots: &[String],
+    out_dir: Option<&std::path::Path>,
+) -> Result<(ModuleExecutionOutput, DeNovoStagePlan), String> {
+    let ch = mol
+        .chain(target_chain)
+        .or_else(|| mol.chains.last())
+        .ok_or_else(|| format!("target chain '{target_chain}' not found"))?;
+    let protein_res: Vec<_> = ch
+        .residues
+        .iter()
+        .filter(|r| r.class == ResidueClass::Protein)
+        .collect();
+    if protein_res.is_empty() {
+        return Err(format!("chain '{}' contains no protein residues", ch.id));
+    }
+    let min_r = protein_res.first().map_or(1, |r| r.res_seq);
+    let max_r = protein_res.last().map_or(100, |r| r.res_seq);
+
+    // Auto-select top surface-accessible residues on target chain if caller omitted hotspots
+    let chosen_hotspots: Vec<String> = if !hotspots.is_empty() {
+        hotspots.to_vec()
+    } else {
+        let sasa = compute_sasa(&mol.atoms, 1.4, 20);
+        let mut ranked: Vec<(i32, f64)> = protein_res
+            .iter()
+            .map(|r| {
+                let rs: f64 = r.atom_indices.iter().map(|&i| sasa[i]).sum();
+                (r.res_seq, rs)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        ranked
+            .into_iter()
+            .take(5)
+            .map(|(rseq, _)| format!("{}{rseq}", ch.id))
+            .collect()
+    };
+
+    let req = DeNovoRequest {
+        campaign_name: format!("{}_chain{}_binder", mol.id, ch.id),
+        target_pdb_path: format!("{}.pdb", mol.id),
+        target_chain: ch.id,
+        target_residue_range: format!("{min_r}-{max_r}"),
+        hotspot_residues: chosen_hotspots.clone(),
+        binder_length_min: 65,
+        binder_length_max: 95,
+        num_designs: 50,
+        mpnn_seqs_per_backbone: 8,
+        cofold_backend: "boltz2".to_string(),
+    };
+    let plan = stage_denovo_binder(&req);
+    let md = render_denovo_markdown(&plan);
+
+    if let Some(dir) = out_dir {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("target.pdb"), write_pdb(mol)).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("denovo_plan.md"), &md).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("score_esm2.py"), &plan.esm2_scoring_script)
+            .map_err(|e| e.to_string())?;
+        std::fs::write(
+            dir.join("fixed_chains.jsonl"),
+            &plan.proteinmpnn_fixed_chains_jsonl,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    let mut highlights = HashMap::new();
+    let mut spheres = Vec::new();
+    for hs in &chosen_hotspots {
+        let digits: String = hs
+            .chars()
+            .filter(|c| c.is_ascii_digit() || *c == '-')
+            .collect();
+        if let Ok(rseq) = digits.parse::<i32>()
+            && let Some(r) = protein_res.iter().find(|r| r.res_seq == rseq)
+            && let Some(gi) = r.guide_idx
+        {
+            highlights.insert((ch.id, rseq), [0.98, 0.22, 0.38]);
+            spheres.push(SphereOverlay {
+                label: format!("Hotspot {hs}"),
+                category: "DeNovo Hotspot".to_string(),
+                coords: mol.atoms[gi].coords,
+                radius_a: 1.65,
+                rgba: [0.98, 0.20, 0.38, 0.78],
+            });
+        }
+    }
+
+    let vis = ModuleExecutionOutput {
+        module_name: ModuleId::DeNovoCoFold.label().to_string(),
+        recommended_repr: Some(RepresentationKind::Cartoon),
+        recommended_color: Some(ColorScheme::Chain),
+        residue_highlights: highlights,
+        sphere_overlays: spheres,
+        line_overlays: Vec::new(),
+        summary_markdown: md,
+        provenance: vec![ProvenanceEntry {
+            kind: ProvenanceKind::ComputationalPrediction,
+            source_app: "biomolcraft::mod-denovo (RFdiffusion/MPNN/Boltz-2 Staging)".to_string(),
+            summary: format!(
+                "Staged de novo binder campaign on chain {} with {} hotspots (0 GB weights downloaded).",
+                ch.id,
+                chosen_hotspots.len()
+            ),
+        }],
+    };
+    Ok((vis, plan))
+}
+
+/// Declarative external plugin manifest (`$CRAFT_DATA_DIR/plugins/*.json`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeclarativePluginManifest {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub dsl_macro: String,
+}
+
+/// Discovered external plugin entry (either safe declarative JSON macro or validated `.wasm` binary).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredPlugin {
+    pub file_name: String,
+    pub kind: String,
+    pub summary: String,
+    pub wasm_report: Option<WasmPluginReport>,
+    pub json_manifest: Option<DeclarativePluginManifest>,
+}
+
+/// Discover and safely validate declarative `.json` and `.wasm` plugins under `$CRAFT_DATA_DIR/plugins`.
+#[must_use]
+pub fn discover_installed_plugins() -> Vec<DiscoveredPlugin> {
+    let dir = craft_data_dir().join("plugins");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let fname = entry.file_name().to_string_lossy().to_string();
+        match path.extension().and_then(|s| s.to_str()) {
+            Some("json") => {
+                if let Ok(raw) = std::fs::read_to_string(&path)
+                    && let Ok(man) = serde_json::from_str::<DeclarativePluginManifest>(&raw)
+                {
+                    out.push(DiscoveredPlugin {
+                        file_name: fname,
+                        kind: "Declarative DSL Macro".to_string(),
+                        summary: format!("{} v{} — {}", man.name, man.version, man.description),
+                        wasm_report: None,
+                        json_manifest: Some(man),
+                    });
+                }
+            }
+            Some("wasm") => {
+                if let Ok(bytes) = std::fs::read(&path)
+                    && let Ok(wrep) = inspect_wasm_plugin(&bytes)
+                {
+                    out.push(DiscoveredPlugin {
+                        file_name: fname,
+                        kind: "Validated WASM Module (Read-Only Inspect)".to_string(),
+                        summary: format!(
+                            "WASM v{}, {} bytes, {} sections, exports: {:?}",
+                            wrep.version, wrep.total_bytes, wrep.section_count, wrep.exports
+                        ),
+                        wasm_report: Some(wrep),
+                        json_manifest: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }

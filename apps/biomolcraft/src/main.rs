@@ -9,13 +9,16 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use biomol_modules::{
-    ModuleId, run_adc_module, run_antibody_module, run_enzyme_module, run_ncrna_module,
-    run_pk_tmdd_module,
+    ModuleId, discover_installed_plugins, run_adc_module, run_antibody_module, run_enzyme_module,
+    run_ncrna_module, run_pk_tmdd_module,
 };
 use biomol_physics::{OpenMmEnvStatus, check_openmm_biomol_env};
 use biomol_rna::{NcRnaAnalysisReport, analyze_ncrna_mrna, find_rna_preset, rna_presets};
 use biomol_script::BiomolSession;
-use craftbio_scene::{ColorScheme, CraftBioLinkServer, InboundLinkCommand, RepresentationKind};
+use craftbio_scene::{
+    ColorScheme, CraftBioLinkServer, InboundLinkCommand, RepresentationKind,
+    discover_craft_instances,
+};
 use craftbio_struct::ResidueClass;
 use craftbio_viewport::{SharedViewportScene, show_biomol_viewport};
 use eframe::egui;
@@ -24,10 +27,13 @@ use eframe::egui;
 enum RightModuleTab {
     Modeling,
     Physics,
+    CryoEm,
     Antibodies,
     NcRnaMrna,
     Enzymes,
     AdcPk,
+    DeNovo,
+    SuitePlugins,
     Evidence,
 }
 
@@ -50,10 +56,15 @@ pub struct BiomolCraftApp {
     traj_fps: f32,
     last_frame_tick: Instant,
 
-    // Physics module state
+    // Physics & Cryo-EM / De Novo state
     anm_mode_sel: usize,
     anm_amp_a: f64,
     openmm_status: OpenMmEnvStatus,
+    cryoem_res_a: f64,
+    cryoem_sigma: f64,
+    denovo_chain: String,
+    denovo_hotspots: String,
+    live_peers_summary: String,
 
     // Mutagenesis wizard state
     mut_chain: String,
@@ -103,6 +114,11 @@ impl Default for BiomolCraftApp {
             anm_mode_sel: 1,
             anm_amp_a: 2.2,
             openmm_status: check_openmm_biomol_env(),
+            cryoem_res_a: 4.5,
+            cryoem_sigma: 1.5,
+            denovo_chain: "C".to_string(),
+            denovo_hotspots: "C558 C560 C573".to_string(),
+            live_peers_summary: "Click 'Scan Craft Link v1 Peers' to detect live CraftBio & ArtCraft apps.".to_string(),
             mut_chain: "B".to_string(),
             mut_res_seq: 105,
             mut_target_aa: 'A',
@@ -382,7 +398,7 @@ impl eframe::App for BiomolCraftApp {
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        egui::RichText::new("BiomolCraft v0.2.1 · CraftBio 3D Biomolecular Studio")
+                        egui::RichText::new("BiomolCraft v0.3.0 · CraftBio 3D Biomolecular Studio")
                             .strong()
                             .color(egui::Color32::from_rgb(56, 189, 248)),
                     );
@@ -597,10 +613,13 @@ impl eframe::App for BiomolCraftApp {
                     for (t, lbl) in [
                         (RightModuleTab::Modeling, "Model 3D"),
                         (RightModuleTab::Physics, "Physics"),
+                        (RightModuleTab::CryoEm, "Cryo-EM"),
                         (RightModuleTab::Antibodies, "Ab / VHH"),
                         (RightModuleTab::NcRnaMrna, "ncRNA/mRNA"),
                         (RightModuleTab::Enzymes, "Enzymes"),
                         (RightModuleTab::AdcPk, "ADC / PK"),
+                        (RightModuleTab::DeNovo, "De Novo"),
+                        (RightModuleTab::SuitePlugins, "Suite/Plugins"),
                         (RightModuleTab::Evidence, "Evidence"),
                     ] {
                         ui.selectable_value(&mut self.right_tab, t, lbl);
@@ -610,10 +629,13 @@ impl eframe::App for BiomolCraftApp {
                 egui::ScrollArea::vertical().show(ui, |ui| match self.right_tab {
                     RightModuleTab::Modeling => self.ui_modeling_module(ui),
                     RightModuleTab::Physics => self.ui_physics_module(ui),
+                    RightModuleTab::CryoEm => self.ui_cryoem_module(ui),
                     RightModuleTab::Antibodies => self.ui_antibody_module(ui),
                     RightModuleTab::NcRnaMrna => self.ui_ncrna_module(ui),
                     RightModuleTab::Enzymes => self.ui_enzyme_module(ui),
                     RightModuleTab::AdcPk => self.ui_adc_pk_module(ui),
+                    RightModuleTab::DeNovo => self.ui_denovo_module(ui),
+                    RightModuleTab::SuitePlugins => self.ui_suite_plugins_module(ui),
                     RightModuleTab::Evidence => self.ui_evidence_panel(ui),
                 });
             });
@@ -903,6 +925,108 @@ impl BiomolCraftApp {
         });
         ui.separator();
         ui.monospace(&self.session.last_module_markdown);
+    }
+
+    fn ui_cryoem_module(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Cryo-EM MRC2014 & OpenDX Volumetric Maps");
+        ui.horizontal(|ui| {
+            ui.label("MolMap Res (Å):");
+            ui.add(
+                egui::DragValue::new(&mut self.cryoem_res_a)
+                    .range(2.0..=12.0)
+                    .speed(0.25),
+            );
+            ui.label("Contour (σ):");
+            ui.add(
+                egui::DragValue::new(&mut self.cryoem_sigma)
+                    .range(0.5..=5.0)
+                    .speed(0.1),
+            );
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Synthesize MolMap + Contour").clicked() {
+                let cmd = format!("molmap {:.1} {:.1}", self.cryoem_res_a, self.cryoem_sigma);
+                self.run_dsl(&cmd);
+            }
+            if ui.button("Rigid Fit-in-Map (fitmap)").clicked() {
+                self.run_dsl("fitmap");
+            }
+        });
+        ui.small(
+            "Load external `.mrc`/`.map`/`.dx` volumes via DSL: `open_map /path/to/map.mrc 1.5`",
+        );
+        ui.separator();
+        ui.monospace(&self.session.last_module_markdown);
+    }
+
+    fn ui_denovo_module(&mut self, ui: &mut egui::Ui) {
+        ui.heading("De Novo & Co-Fold Epitope Staging (0 GB Weights)");
+        ui.horizontal(|ui| {
+            ui.label("Target Chain:");
+            ui.add(egui::TextEdit::singleline(&mut self.denovo_chain).desired_width(36.0));
+            if ui.button("+ Add Picked Residue").clicked() {
+                let tag = format!("{}{}", self.mut_chain, self.mut_res_seq);
+                if !self.denovo_hotspots.contains(&tag) {
+                    if !self.denovo_hotspots.is_empty() {
+                        self.denovo_hotspots.push(' ');
+                    }
+                    self.denovo_hotspots.push_str(&tag);
+                }
+            }
+        });
+        ui.label("3D Epitope Hotspots:");
+        ui.add(egui::TextEdit::singleline(&mut self.denovo_hotspots).desired_width(f32::INFINITY));
+        if ui
+            .button("Paint Hotspots in 3D & Stage RFdiffusion/MPNN/Boltz-2")
+            .clicked()
+        {
+            let cmd = format!("denovo {} {}", self.denovo_chain, self.denovo_hotspots);
+            self.run_dsl(&cmd);
+        }
+        ui.separator();
+        ui.monospace(&self.session.last_module_markdown);
+    }
+
+    fn ui_suite_plugins_module(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Craft Link v1 · ArtCraft Export · WASM/JSON Plugins");
+        ui.horizontal(|ui| {
+            if ui.button("Scan Craft Link v1 Peers").clicked() {
+                match discover_craft_instances(None, None) {
+                    Ok(peers) => {
+                        if peers.is_empty() {
+                            self.live_peers_summary = "No live peers detected.".to_string();
+                        } else {
+                            let list: Vec<String> = peers
+                                .iter()
+                                .map(|p| format!("{} v{} (pid {})", p.app, p.app_version, p.pid))
+                                .collect();
+                            self.live_peers_summary = format!("Live peers: {}", list.join(", "));
+                        }
+                    }
+                    Err(e) => self.live_peers_summary = format!("Scan error: {e}"),
+                }
+            }
+            if ui.button("Export Offline Mol* HTML").clicked() {
+                self.run_dsl("export_html /tmp/biomolcraft_dossier.html");
+            }
+        });
+        if ui
+            .button("Export ArtCraft Bundle (WordCraft / DeckCraft / GridCraft)")
+            .clicked()
+        {
+            self.run_dsl("export_artcraft /tmp/biomolcraft_artcraft");
+        }
+        ui.small(&self.live_peers_summary);
+        ui.separator();
+        ui.strong("Installed Plugins ($CRAFT_DATA_DIR/plugins):");
+        let plugins = discover_installed_plugins();
+        if plugins.is_empty() {
+            ui.small("No external .json or .wasm plugins installed yet.");
+        } else {
+            for p in plugins {
+                ui.label(format!("• [{}] {}: {}", p.kind, p.file_name, p.summary));
+            }
+        }
     }
 
     fn ui_evidence_panel(&mut self, ui: &mut egui::Ui) {

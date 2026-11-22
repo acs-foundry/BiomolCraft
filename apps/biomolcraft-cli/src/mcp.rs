@@ -10,6 +10,7 @@ use biomol_script::BiomolSession;
 use craft_mcp_server::{
     Effect, Info, Options, Server, Tools, image_result, object, string, text_result, tool,
 };
+use craftbio_report::write_biomol_html_dossier;
 use craftbio_sandbox::PathSandbox;
 use craftbio_struct::{write_mmcif, write_pdb};
 use craftbio_viewport::render_scene_png_bytes;
@@ -157,6 +158,42 @@ impl Tools for BiomolTools {
                 "Detect catalytic triads/dyads, metal/cofactor coordination spheres, 3D substrate access tunnels, and thermostabilizing disulfide bridge proposals.",
                 object(json!({}), &[]),
                 Effect::ReadOnly,
+            ),
+            tool(
+                "simulate_cryoem_map",
+                "Cryo-EM MolMap & FitMap",
+                "Synthesize a resolution-filtered 3D Cryo-EM density map (ChimeraX molmap), display volumetric contour beads at sigma_level, and report fitmap correlation.",
+                object(
+                    json!({
+                        "resolution_a": { "type": "number", "description": "Map resolution in Angstroms (default 4.5)" },
+                        "sigma": { "type": "number", "description": "Contour level in sigma (default 1.5)" }
+                    }),
+                    &[],
+                ),
+                Effect::Edits,
+            ),
+            tool(
+                "stage_denovo_binder",
+                "De Novo & Co-Fold Epitope Staging",
+                "Stage a zero-weight RFdiffusion + ProteinMPNN + ESM2 + Boltz-2/Chai-1 de novo binder campaign targeting 3D epitope hotspots on target_chain.",
+                object(
+                    json!({
+                        "chain": string("Target antigen chain ID, e.g. 'C'"),
+                        "hotspots": string("Optional space-separated hotspot residues, e.g. 'C558 C560 C573'")
+                    }),
+                    &["chain"],
+                ),
+                Effect::ReadOnly,
+            ),
+            tool(
+                "export_offline_html_dossier",
+                "Export Offline Mol* 3D HTML Dossier",
+                "Write a self-contained single-file interactive 3D HTML biomolecular dossier inside the sandbox write root.",
+                object(
+                    json!({ "out_path": string("Output HTML filename inside sandbox write root") }),
+                    &["out_path"],
+                ),
+                Effect::Files,
             ),
         ]
     }
@@ -338,6 +375,66 @@ impl Tools for BiomolTools {
                 ),
                 Err(e) => text_result(e.to_string(), true),
             },
+            "simulate_cryoem_map" => {
+                let res = args
+                    .get("resolution_a")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(4.5);
+                let sig = args.get("sigma").and_then(Value::as_f64).unwrap_or(1.5);
+                match self
+                    .session
+                    .execute_dsl(&format!("molmap {res:.1} {sig:.1}"))
+                {
+                    Ok(msg) => text_result(
+                        format!("{msg}\n\n{}", self.session.last_module_markdown),
+                        false,
+                    ),
+                    Err(e) => text_result(e.to_string(), true),
+                }
+            }
+            "stage_denovo_binder" => {
+                let ch = args.get("chain").and_then(Value::as_str).unwrap_or("C");
+                let hs = args.get("hotspots").and_then(Value::as_str).unwrap_or("");
+                let cmd = if hs.trim().is_empty() {
+                    format!("denovo {ch}")
+                } else {
+                    format!("denovo {ch} {hs}")
+                };
+                match self.session.execute_dsl(&cmd) {
+                    Ok(msg) => text_result(
+                        format!("{msg}\n\n{}", self.session.last_module_markdown),
+                        false,
+                    ),
+                    Err(e) => text_result(e.to_string(), true),
+                }
+            }
+            "export_offline_html_dossier" => {
+                let out = args.get("out_path").and_then(Value::as_str).unwrap_or("");
+                let Some(ref mol) = self.session.molecule else {
+                    return text_result("no biomolecule loaded", true);
+                };
+                // Enforce PathSandbox write confinement by creating placeholder inside sandbox first
+                match self.sandbox.write_string(Path::new(out), "") {
+                    Ok(safe_path) => match write_biomol_html_dossier(
+                        &mol.title,
+                        &write_pdb(mol),
+                        &self.session.last_module_markdown,
+                        &[],
+                        true,
+                        &safe_path,
+                    ) {
+                        Ok(sum) => text_result(
+                            format!(
+                                "Wrote offline 3D HTML dossier to {} ({} bytes, molstar_inline_offline={}).",
+                                sum.out_path, sum.bytes, sum.molstar_inline_offline
+                            ),
+                            false,
+                        ),
+                        Err(e) => text_result(e, true),
+                    },
+                    Err(e) => text_result(format!("sandbox write rejected: {e}"), true),
+                }
+            }
             other => text_result(format!("unknown tool '{other}'"), true),
         }
     }
@@ -402,7 +499,7 @@ mod tests {
             .pointer("/result/tools")
             .and_then(Value::as_array)
             .ok_or("no tools")?;
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 14);
 
         let rna = srv
             .handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fold_ncrna_mrna","arguments":{"preset":"guanine_riboswitch"}}}"#)

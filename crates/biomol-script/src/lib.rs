@@ -10,20 +10,23 @@ use biomol_model::{
     audit_structure_prep, minimize_local_mm, mutate_and_repack_best_rotamer, mutate_residue_3d,
 };
 use biomol_modules::{
-    run_adc_module, run_antibody_module, run_enzyme_module, run_ncrna_module,
-    run_physics_anm_module, run_physics_gbsa_module,
+    run_adc_module, run_antibody_module, run_cryoem_molmap_module, run_cryoem_volume_module,
+    run_denovo_cofold_module, run_enzyme_module, run_ncrna_module, run_physics_anm_module,
+    run_physics_gbsa_module,
 };
 use biomol_physics::run_local_langevin_md;
 use biomol_rna::{analyze_ncrna_mrna, find_rna_preset, render_rna_markdown};
+use craftbio_report::{export_artcraft_bundle, write_biomol_html_dossier};
 use craftbio_scene::{
     ColorScheme, CraftSceneDocument, ProvenanceEntry, ProvenanceKind, RepresentationKind,
 };
 use craftbio_struct::{
-    Biomolecule, evaluate_selection, load_dcd_frames, matchmaker_align, parse_structure_auto,
-    write_mmcif, write_multi_model_pdb, write_pdb,
+    Biomolecule, VolumeGrid3D, evaluate_selection, load_dcd_frames, matchmaker_align, parse_dx_map,
+    parse_mrc_map, parse_structure_auto, write_mmcif, write_multi_model_pdb, write_pdb,
 };
 use craftbio_viewport::{
-    Camera3D, RenderOptions, RenderSceneData, build_render_scene, write_scene_png,
+    Camera3D, RenderOptions, RenderSceneData, build_render_scene, render_scene_png_bytes,
+    write_scene_png,
 };
 use thiserror::Error;
 
@@ -39,6 +42,7 @@ pub enum ScriptError {
 #[derive(Debug, Clone)]
 pub struct BiomolSession {
     pub molecule: Option<Biomolecule>,
+    pub active_volume: Option<VolumeGrid3D>,
     pub source_path: Option<String>,
     pub camera: Camera3D,
     pub render_opts: RenderOptions,
@@ -55,6 +59,7 @@ impl Default for BiomolSession {
     fn default() -> Self {
         Self {
             molecule: None,
+            active_volume: None,
             source_path: None,
             camera: Camera3D::default(),
             render_opts: RenderOptions::default(),
@@ -608,6 +613,152 @@ impl BiomolSession {
                 Ok(msg)
             }
             "tunnels" => self.execute_single_cmd("module enzymes"),
+            "molmap" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                let res: f64 = toks.first().and_then(|s| s.parse().ok()).unwrap_or(4.5);
+                let sigma: f64 = toks.get(1).and_then(|s| s.parse().ok()).unwrap_or(1.5);
+                let mol = self
+                    .molecule
+                    .as_mut()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let (vis, grid, fit) =
+                    run_cryoem_molmap_module(mol, res, sigma).map_err(ScriptError::Command)?;
+                self.active_volume = Some(grid);
+                self.render_opts.sphere_overlays = vis.sphere_overlays;
+                self.last_module_markdown = vis.summary_markdown;
+                self.provenance.extend(vis.provenance);
+                self.dirty_geometry = true;
+                Ok(format!(
+                    "Synthesized {:.1} Å Cryo-EM molmap ({:.1}σ): CC={:.3}, {:.1}% atoms >= 1σ.",
+                    res, sigma, fit.correlation_after, fit.atoms_inside_1sigma_pct
+                ))
+            }
+            "open_map" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                let path_s = toks
+                    .first()
+                    .copied()
+                    .ok_or_else(|| ScriptError::Command("usage: open_map <map.mrc|map.dx> [sigma]".to_string()))?;
+                let sigma: f64 = toks.get(1).and_then(|s| s.parse().ok()).unwrap_or(1.5);
+                let grid = if path_s.to_ascii_lowercase().ends_with(".dx") {
+                    let txt = std::fs::read_to_string(path_s)?;
+                    parse_dx_map(path_s, &txt).map_err(|e| ScriptError::Command(e.to_string()))?
+                } else {
+                    let bytes = std::fs::read(path_s)?;
+                    parse_mrc_map(path_s, &bytes).map_err(|e| ScriptError::Command(e.to_string()))?
+                };
+                let mol = self
+                    .molecule
+                    .as_mut()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let (vis, fit) = run_cryoem_volume_module(mol, &grid, sigma, false);
+                self.active_volume = Some(grid);
+                self.render_opts.sphere_overlays = vis.sphere_overlays;
+                self.last_module_markdown = vis.summary_markdown;
+                self.provenance.extend(vis.provenance);
+                self.dirty_geometry = true;
+                Ok(format!(
+                    "Loaded volumetric map '{path_s}' ({sigma:.1}σ): CC={:.3}.",
+                    fit.correlation_after
+                ))
+            }
+            "fitmap" => {
+                let grid = self
+                    .active_volume
+                    .clone()
+                    .ok_or_else(|| ScriptError::Command("no active volume map (run `molmap` or `open_map` first)".to_string()))?;
+                let mol = self
+                    .molecule
+                    .as_mut()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let (vis, fit) = run_cryoem_volume_module(mol, &grid, 1.5, true);
+                self.render_opts.sphere_overlays = vis.sphere_overlays;
+                self.last_module_markdown = vis.summary_markdown;
+                self.provenance.extend(vis.provenance);
+                self.dirty_geometry = true;
+                Ok(format!(
+                    "fitmap complete: CC {:.3} -> {:.3}, shift {:?} Å.",
+                    fit.correlation_before, fit.correlation_after, fit.translation_applied_a
+                ))
+            }
+            "denovo" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                let ch = toks
+                    .first()
+                    .and_then(|s| s.chars().next())
+                    .unwrap_or('C');
+                let hotspots: Vec<String> = toks.iter().skip(1).map(|s| (*s).to_string()).collect();
+                let mol = self
+                    .molecule
+                    .as_ref()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let (vis, plan) = run_denovo_cofold_module(mol, ch, &hotspots, None)
+                    .map_err(ScriptError::Command)?;
+                self.render_opts.residue_highlights = vis.residue_highlights;
+                self.render_opts.sphere_overlays = vis.sphere_overlays;
+                self.last_module_markdown = vis.summary_markdown;
+                self.provenance.extend(vis.provenance);
+                self.dirty_geometry = true;
+                Ok(format!(
+                    "Staged De Novo & Co-Fold campaign '{}' (contig {}).",
+                    plan.campaign_name, plan.rfdiffusion_contig
+                ))
+            }
+            "export_html" => {
+                if rest.is_empty() {
+                    return Err(ScriptError::Command("usage: export_html <out.html>".to_string()));
+                }
+                let mol = self
+                    .molecule
+                    .as_ref()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let sum = write_biomol_html_dossier(
+                    &mol.title,
+                    &write_pdb(mol),
+                    &self.last_module_markdown,
+                    &[],
+                    true,
+                    Path::new(rest),
+                )
+                .map_err(ScriptError::Command)?;
+                Ok(format!(
+                    "Exported interactive 3D HTML dossier to {} ({} bytes, offline_molstar={}).",
+                    sum.out_path, sum.bytes, sum.molstar_inline_offline
+                ))
+            }
+            "export_artcraft" => {
+                if rest.is_empty() {
+                    return Err(ScriptError::Command(
+                        "usage: export_artcraft <out_dir>".to_string(),
+                    ));
+                }
+                let title = self
+                    .molecule
+                    .as_ref()
+                    .map_or_else(|| "BiomolCraft Scene".to_string(), |m| m.title.clone());
+                let atom_cnt = self.molecule.as_ref().map_or(0, |m| m.atoms.len());
+                let scene = self.build_viewport_scene();
+                let png = render_scene_png_bytes(&scene, &self.camera, 1600, 1200, false)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                let rows = vec![
+                    ("Structure", title.clone()),
+                    ("Atoms", atom_cnt.to_string()),
+                    ("Representation", self.render_opts.representation.label().to_string()),
+                    ("Color Scheme", self.render_opts.color_scheme.label().to_string()),
+                ];
+                let sum = export_artcraft_bundle(
+                    &title,
+                    &png,
+                    &rows,
+                    &self.last_module_markdown,
+                    Path::new(rest),
+                )
+                .map_err(ScriptError::Command)?;
+                Ok(format!(
+                    "Exported ArtCraft bundle (PNG + GridCraft TSV + WordCraft/DeckCraft MD) to {}.",
+                    sum.out_dir
+                ))
+            }
             "undo" => {
                 if let Some(prev) = self.undo_stack.pop() {
                     if let Some(cur) = self.molecule.replace(prev) {
