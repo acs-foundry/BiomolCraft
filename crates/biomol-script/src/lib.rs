@@ -250,6 +250,11 @@ impl BiomolSession {
             ArtCraftTarget::DeckCraft => sum.deckcraft_slides_md.clone(),
             ArtCraftTarget::WordCraft | ArtCraftTarget::GridCraft => sum.wordcraft_md.clone(),
         };
+        let native_doc_path = match target {
+            ArtCraftTarget::WordCraft => sum.wordcraft_docx.clone(),
+            ArtCraftTarget::DeckCraft => sum.deckcraft_pptx.clone(),
+            ArtCraftTarget::GridCraft => sum.gridcraft_xlsx.clone(),
+        };
         let payload = ArtCraftPushPayload {
             target,
             title,
@@ -258,6 +263,7 @@ impl BiomolSession {
             figure_png_path: sum.figure_png,
             markdown_path,
             table_tsv_path: sum.gridcraft_tsv,
+            native_doc_path,
             summary_markdown: self.last_module_markdown.clone(),
         };
         let res = push_to_artcraft_via_craft_link(None, &payload)
@@ -2434,8 +2440,23 @@ impl BiomolSession {
                     Path::new(rest),
                 )
                 .map_err(ScriptError::Command)?;
+                let mut extras = Vec::new();
+                if let Some(p) = sum.wordcraft_docx {
+                    extras.push(format!("DOCX={p}"));
+                }
+                if let Some(p) = sum.deckcraft_pptx {
+                    extras.push(format!("PPTX={p}"));
+                }
+                if let Some(p) = sum.gridcraft_xlsx {
+                    extras.push(format!("XLSX={p}"));
+                }
+                let native_note = if extras.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [Native ArtCraft Office: {}]", extras.join(", "))
+                };
                 Ok(format!(
-                    "Exported ArtCraft bundle (PNG + GridCraft TSV + WordCraft/DeckCraft MD) to {}.",
+                    "Exported ArtCraft bundle (PNG + GridCraft TSV + WordCraft/DeckCraft MD) to {}.{native_note}",
                     sum.out_dir
                 ))
             }
