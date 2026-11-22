@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use biomol_enzyme::{analyze_enzyme_engineering, render_enzyme_markdown};
 use biomol_model::{
-    audit_structure_prep, minimize_local_mm, mutate_and_repack_best_rotamer, mutate_residue_3d,
+    audit_structure_prep, build_de_novo_peptide_3d, build_de_novo_rna_helix_3d, minimize_local_mm,
+    mutate_and_repack_best_rotamer, mutate_residue_3d, swapna_nucleotide_3d,
 };
 use biomol_modules::{
     discover_installed_plugins, run_adc_module, run_antibody_module, run_cryoem_molmap_module,
@@ -33,10 +34,10 @@ use craftbio_scene::{
     send_trajectory_via_craft_link,
 };
 use craftbio_struct::{
-    cealign_superpose, detect_clashes, detect_contacts, detect_hbonds,
-    estimate_pae_proxy_from_structure, load_dcd_frames, matchmaker_align, morph_biomolecules,
-    parse_dx_map, parse_mrc_map, parse_pae_json, parse_structure_auto, write_mrc_map,
-    write_multi_model_pdb, write_pdb,
+    cealign_superpose, detect_clashes, detect_contacts, detect_hbonds, detect_snfg_glycans,
+    estimate_pae_proxy_from_structure, generate_biological_assembly, generate_crystal_mates,
+    load_dcd_frames, matchmaker_align, morph_biomolecules, parse_dx_map, parse_mrc_map,
+    parse_pae_json, parse_structure_auto, write_mrc_map, write_multi_model_pdb, write_pdb,
 };
 use craftbio_viewport::{render_scene_png_bytes, write_scene_png};
 
@@ -471,6 +472,85 @@ enum Commands {
         fps: u16,
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Mutate an RNA/DNA nucleotide in 3D (`swapna`, preserving ribose-phosphate backbone & base plane).
+    Swapna {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long)]
+        chain: char,
+        #[arg(long)]
+        res: i32,
+        #[arg(long)]
+        base: char,
+        #[arg(long)]
+        out_pdb: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Build a de novo 3D polypeptide (`helix|sheet|extended`) or A-form RNA duplex (`rna`).
+    Build {
+        #[arg(long, default_value = "helix", help = "helix | sheet | extended | rna")]
+        kind: String,
+        #[arg(long)]
+        seq: String,
+        #[arg(long, default_value_t = 'A')]
+        chain: char,
+        #[arg(long)]
+        out_pdb: Option<PathBuf>,
+        #[arg(long)]
+        out_png: Option<PathBuf>,
+    },
+    /// Biological Assembly (`sym`) & Crystallographic Symmetry Mates (`symexp` + `CRYST1` Unit Cell).
+    Sym {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(
+            long,
+            default_value = "symexp",
+            help = "bioassembly | symexp | contacts"
+        )]
+        mode: String,
+        #[arg(long, default_value_t = 5.0)]
+        cutoff: f64,
+        #[arg(long)]
+        unitcell: bool,
+        #[arg(long)]
+        out_pdb: Option<PathBuf>,
+        #[arg(long)]
+        out_png: Option<PathBuf>,
+    },
+    /// Detect & render 3D SNFG Glycans (GlcNAc cubes, Man/Gal spheres, Fuc cones, Neu5Ac diamonds).
+    Glycans {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long)]
+        out_md: Option<PathBuf>,
+        #[arg(long)]
+        out_png: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Volumetric Map Operations (`vop`: gaussian | sharpen | zone | hide_dust | orthoplanes).
+    Vop {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long)]
+        map: Option<PathBuf>,
+        #[arg(
+            long,
+            default_value = "sharpen",
+            help = "gaussian | sharpen | zone | hide_dust | orthoplanes"
+        )]
+        op: String,
+        #[arg(long, default_value_t = 1.5)]
+        param: f64,
+        #[arg(long, default_value_t = 1.5)]
+        sigma: f64,
+        #[arg(long)]
+        out_mrc: Option<PathBuf>,
+        #[arg(long)]
+        out_png: Option<PathBuf>,
     },
 }
 
@@ -1629,6 +1709,211 @@ fn run() -> Result<(), String> {
                 ))
                 .map_err(|e| e.to_string())?;
             println!("{msg}");
+        }
+        Commands::Swapna {
+            pdb,
+            chain,
+            res,
+            base,
+            out_pdb,
+            json,
+        } => {
+            let raw = std::fs::read_to_string(&pdb).map_err(|e| e.to_string())?;
+            let mut mol = parse_structure_auto("rna", &raw).map_err(|e| e.to_string())?;
+            let rep =
+                swapna_nucleotide_3d(&mut mol, chain, res, base).map_err(|e| e.to_string())?;
+            if let Some(p) = out_pdb {
+                write_text(&p, &write_pdb(&mol))?;
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rep).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!(
+                    "swapna {chain}:{}{res}{} ({}): {} clashes, {} H-bonds, {} 3D base pairs.",
+                    rep.wild_type,
+                    rep.mutant,
+                    if rep.is_dna { "DNA" } else { "RNA" },
+                    rep.clash_count,
+                    rep.hbond_count,
+                    rep.base_pairs_after
+                );
+            }
+        }
+        Commands::Build {
+            kind,
+            seq,
+            chain,
+            out_pdb,
+            out_png,
+        } => {
+            let mol = if kind.eq_ignore_ascii_case("rna") || kind.eq_ignore_ascii_case("duplex") {
+                build_de_novo_rna_helix_3d(&seq, chain)
+            } else {
+                build_de_novo_peptide_3d(&seq, &kind, chain)
+            }
+            .map_err(|e| e.to_string())?;
+            let pdb_txt = write_pdb(&mol);
+            if let Some(p) = out_pdb {
+                write_text(&p, &pdb_txt)?;
+                println!("Wrote built 3D '{kind}' PDB -> {}", p.display());
+            }
+            if let Some(p) = out_png {
+                let mut sess = BiomolSession::default();
+                let _ = sess.load_structure_text(&mol.id, &pdb_txt, None);
+                let _ = sess.execute_dsl("preset pub_white; scalebar 15");
+                let sc = sess.build_viewport_scene();
+                let bytes = write_scene_png(&sc, &sess.camera, 1600, 1200, false, &p)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "Rendered built 3D structure PNG -> {} ({bytes} bytes).",
+                    p.display()
+                );
+            } else {
+                println!(
+                    "Built 3D '{}' ({} atoms, {} chains, {} 3D RNA base pairs).",
+                    mol.title,
+                    mol.atoms.len(),
+                    mol.chains.len(),
+                    mol.base_pairs.len()
+                );
+            }
+        }
+        Commands::Sym {
+            pdb,
+            mode,
+            cutoff,
+            unitcell,
+            out_pdb,
+            out_png,
+        } => {
+            let mut sess = BiomolSession::default();
+            sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+            let mol = sess.active_molecule().ok_or("no molecule")?.clone();
+            match mode.to_ascii_lowercase().as_str() {
+                "bioassembly" | "sym" => {
+                    let bio = generate_biological_assembly(&mol).map_err(|e| e.to_string())?;
+                    println!(
+                        "Biological Assembly: {} atoms across {} chains ({} BIOMT ops).",
+                        bio.atoms.len(),
+                        bio.chains.len(),
+                        mol.biomt_ops.len()
+                    );
+                    if let Some(p) = out_pdb {
+                        write_text(&p, &write_pdb(&bio))?;
+                    }
+                    let _ = sess.execute_dsl("sym");
+                }
+                _ => {
+                    let (mates, contacts) =
+                        generate_crystal_mates(&mol, cutoff).map_err(|e| e.to_string())?;
+                    println!(
+                        "Crystal Symmetry ({:?}): {} mate(s) within {cutoff:.1} Å ({contacts} sampled contact pairs <= 4.0 Å).",
+                        mol.unit_cell.as_ref().map(|u| u.space_group.as_str()),
+                        mates.len()
+                    );
+                    if let Some(p) = out_pdb
+                        && let Some((_, first_mate)) = mates.first()
+                    {
+                        write_text(&p, &write_pdb(first_mate))?;
+                    }
+                    let _ = sess.execute_dsl(&format!("symexp {cutoff:.1}"));
+                }
+            }
+            if unitcell {
+                let _ = sess.execute_dsl("unitcell on");
+            }
+            if let Some(p) = out_png {
+                let _ = sess.execute_dsl("preset pub_dark; scalebar 25");
+                let sc = sess.build_viewport_scene();
+                let bytes = write_scene_png(&sc, &sess.camera, 1600, 1200, false, &p)
+                    .map_err(|e| e.to_string())?;
+                println!("Rendered Symmetry PNG -> {} ({bytes} bytes).", p.display());
+            }
+        }
+        Commands::Glycans {
+            pdb,
+            out_md,
+            out_png,
+            json,
+        } => {
+            let mut sess = BiomolSession::default();
+            sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+            let mol = sess.active_molecule().ok_or("no molecule")?.clone();
+            let rep = detect_snfg_glycans(&mol);
+            let _ = sess.execute_dsl("preset pub_white; snfg on; scalebar 25");
+            if let Some(p) = out_md {
+                write_text(&p, &sess.last_module_markdown)?;
+            }
+            if let Some(p) = out_png {
+                let _ = sess.execute_dsl("2dlabel 0.03 0.03 SNFG 3D Glycans");
+                let sc = sess.build_viewport_scene();
+                let bytes = write_scene_png(&sc, &sess.camera, 1600, 1200, false, &p)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "Rendered SNFG 3D Glycans PNG -> {} ({bytes} bytes).",
+                    p.display()
+                );
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rep).map_err(|e| e.to_string())?
+                );
+            } else {
+                print!("{}", sess.last_module_markdown);
+            }
+        }
+        Commands::Vop {
+            pdb,
+            map,
+            op,
+            param,
+            sigma,
+            out_mrc,
+            out_png,
+        } => {
+            let mut sess = BiomolSession::default();
+            sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+            if let Some(mp) = map {
+                let _ = sess
+                    .execute_dsl(&format!("open_map {} {sigma:.2}", mp.display()))
+                    .map_err(|e| e.to_string())?;
+            } else {
+                let _ = sess
+                    .execute_dsl(&format!("molmap 4.5 {sigma:.2}"))
+                    .map_err(|e| e.to_string())?;
+            }
+            let vop_cmd = if op.eq_ignore_ascii_case("orthoplanes") {
+                "vop orthoplanes on".to_string()
+            } else {
+                format!("vop {op} {param:.2}")
+            };
+            let msg = sess.execute_dsl(&vop_cmd).map_err(|e| e.to_string())?;
+            println!("{msg}");
+            if let Some(p) = out_mrc
+                && let Some(ref g) = sess.active_volume
+            {
+                if let Some(parent) = p.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&p, write_mrc_map(g)).map_err(|e| e.to_string())?;
+                println!("Wrote filtered MRC2014 volume -> {}", p.display());
+            }
+            if let Some(p) = out_png {
+                let _ = sess.execute_dsl("preset pub_dark; scalebar 15");
+                let sc = sess.build_viewport_scene();
+                let bytes = write_scene_png(&sc, &sess.camera, 1600, 1200, false, &p)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "Rendered Volumetric VOP PNG -> {} ({bytes} bytes).",
+                    p.display()
+                );
+            }
         }
     }
     Ok(())

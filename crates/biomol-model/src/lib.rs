@@ -4,6 +4,15 @@
 //! (Dunbrack Rotamers + Live Steric Clash Discs + Local Repacking), Local MM Energy Minimizer
 //! (ISOLDE-lite Steepest-Descent), and 3D Structure Preparation Audit.
 
+pub mod edit3d;
+
+pub use edit3d::{
+    AddHydrogensReport, BondRotReport, SwapNaReport, TugSculptReport, add_polar_hydrogens_ph,
+    build_de_novo_peptide_3d, build_de_novo_rna_helix_3d, combine_biomolecules,
+    delete_atoms_by_mask, evaluate_local_binding_proxy, rename_chain, renumber_chain,
+    rotate_bond_torsion, swapna_nucleotide_3d, tug_atom_with_sculpting,
+};
+
 use craftbio_scene::SphereOverlay;
 use craftbio_struct::{
     Atom, BioStructError, Biomolecule, ResidueClass, aa1_to_aa3, approx_atom_charge, dist3,
@@ -62,19 +71,19 @@ pub struct StructurePrepAudit {
     pub notes: Vec<String>,
 }
 
-fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub(crate) fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-fn add3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub(crate) fn add3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
-fn scale3(a: [f64; 3], s: f64) -> [f64; 3] {
+pub(crate) fn scale3(a: [f64; 3], s: f64) -> [f64; 3] {
     [a[0] * s, a[1] * s, a[2] * s]
 }
 
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub(crate) fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
@@ -82,7 +91,7 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     ]
 }
 
-fn norm3(a: [f64; 3]) -> [f64; 3] {
+pub(crate) fn norm3(a: [f64; 3]) -> [f64; 3] {
     let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
     if l > 1e-9 {
         [a[0] / l, a[1] / l, a[2] / l]
@@ -103,7 +112,7 @@ pub fn dunbrack_chi1_rotamers(aa: char) -> &'static [f64] {
 }
 
 /// Construct idealized heavy sidechain atom coordinates in the local `(N, CA, C)` frame for `aa` at `chi1_deg`.
-fn build_sidechain_atoms(
+pub(crate) fn build_sidechain_atoms(
     n_pos: [f64; 3],
     ca_pos: [f64; 3],
     c_pos: [f64; 3],
@@ -767,6 +776,58 @@ END
         let mask = vec![true; mol.atoms.len()];
         let min_rep = minimize_local_mm(&mut mol, &mask, 40);
         assert!(min_rep.energy_after_kcal <= min_rep.energy_before_kcal + 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn wave6_swapna_bond_rot_tug_builders_and_edit_ops() -> Result<(), Box<dyn std::error::Error>> {
+        // 1. De novo 3D A-form RNA duplex + swapna G -> A
+        let mut rna = build_de_novo_rna_helix_3d("GCGCUAGC", 'X')?;
+        assert_eq!(rna.chains.len(), 2);
+        let sw = swapna_nucleotide_3d(&mut rna, 'X', 1, 'A')?;
+        assert_eq!(sw.wild_type, 'G');
+        assert_eq!(sw.mutant, 'A');
+        assert!(
+            rna.atoms
+                .iter()
+                .any(|a| a.chain == 'X' && a.res_seq == 1 && a.name == "N6")
+        );
+
+        // 2. De novo 3D alpha-helix + addh + bond_rot + tug + renumber + rename + combine + delete
+        let mut pep = build_de_novo_peptide_3d("AKLTYWDSHE", "helix", 'A')?;
+        assert!(pep.atoms.len() > 60);
+        let hr = add_polar_hydrogens_ph(&mut pep, 7.4);
+        assert!(hr.hydrogens_added >= 8);
+
+        // Rotate CA->CB sidechain bond of Tyr5 (acyclic rotatable bond!)
+        let ca_i = pep
+            .atoms
+            .iter()
+            .position(|a| a.res_seq == 5 && a.name == "CA")
+            .ok_or("missing CA")?;
+        let cb_i = pep
+            .atoms
+            .iter()
+            .position(|a| a.res_seq == 5 && a.name == "CB")
+            .ok_or("missing CB")?;
+        let br = rotate_bond_torsion(&mut pep, ca_i, cb_i, 45.0)?;
+        assert!(br.rotated_atoms >= 6);
+
+        let tug = tug_atom_with_sculpting(&mut pep, cb_i, [0.8, 0.0, 0.0], 5.5, 25)?;
+        assert!(tug.atoms_sculpted >= 5);
+
+        let rcnt = renumber_chain(&mut pep, 'A', 101)?;
+        assert_eq!(rcnt, 10);
+        let moved = rename_chain(&mut pep, 'A', 'H')?;
+        assert!(moved > 50);
+
+        let combined = combine_biomolecules(&[&pep, &rna], "pep_rna_combo")?;
+        assert_eq!(combined.chains.len(), 3);
+
+        let mut trimmed = pep.clone();
+        let del_mask: Vec<bool> = trimmed.atoms.iter().map(|a| a.res_seq == 110).collect();
+        let del = delete_atoms_by_mask(&mut trimmed, &del_mask)?;
+        assert!(del > 0);
         Ok(())
     }
 }

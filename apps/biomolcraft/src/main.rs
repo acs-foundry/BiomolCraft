@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
 //! `biomolcraft` — Flagship Pure-Rust `wgpu 24 + egui` Multi-Model Biomolecular 3D Studio,
-//! Interactive Modeling Workbench, Native **`ViewDockX`** (`DockCraft` Craft Link v1),
-//! Chemical Measurements, MSA/PAE, Conformational Morphing & Movie Maker (`v0.5.0`).
+//! Interactive Modeling & Sculpting Workbench (`swapaa`/`swapna`/`bond_rot`/`tug`/`build`),
+//! Native **`ViewDockX`**, Crystallographic Symmetry, 3D SNFG Glycans, Cryo-EM `vop`/Orthoplanes,
+//! Chemical Measurements, MSA/PAE, Conformational Morphing & Movie Maker (`v0.6.0`).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -40,6 +41,7 @@ enum RightModuleTab {
     Measure,
     MsaPae,
     MovieMorph,
+    SymGlycans,
     Modeling,
     Physics,
     CryoEm,
@@ -135,6 +137,18 @@ pub struct BiomolCraftApp {
     movie_width: u32,
     movie_height: u32,
     movie_fps: u16,
+
+    // Wave 6: swapna, bond_rot, tug/sculpting, 3D Builder, Symmetry/SNFG & vop state
+    swapna_base: char,
+    bond_rot_atom_a: String,
+    bond_rot_atom_b: String,
+    bond_rot_deg: f64,
+    tug_atom_spec: String,
+    tug_shift: [f64; 3],
+    build_kind: String,
+    build_seq: String,
+    sym_cutoff_a: f64,
+    vop_zone_rad: f64,
 }
 
 impl Default for BiomolCraftApp {
@@ -164,7 +178,7 @@ impl BiomolCraftApp {
             fetch_id_input: "1CRN".to_string(),
             console_input: String::new(),
             console_log: vec![
-                "BiomolCraft v0.5.0 — Multi-Model wgpu Depth32F+SSAO Studio · Measure/Putty · MSA/PAE · Morph/Movie · ViewDockX. Type 'help'.".to_string(),
+                "BiomolCraft v0.6.0 — wgpu Depth32F+SSAO · swapna/tug/build · Sym/SNFG · vop/Orthoplanes · ViewDockX. Type 'help'.".to_string(),
                 link_status.to_string(),
             ],
             picked_atom_info: "Click any atom/residue in 3D or sequence strip to inspect".to_string(),
@@ -204,6 +218,16 @@ impl BiomolCraftApp {
             movie_width: 800,
             movie_height: 600,
             movie_fps: 12,
+            swapna_base: 'A',
+            bond_rot_atom_a: "B:105:CA".to_string(),
+            bond_rot_atom_b: "B:105:CB".to_string(),
+            bond_rot_deg: 30.0,
+            tug_atom_spec: "B:105:CA".to_string(),
+            tug_shift: [0.8, 0.0, 0.0],
+            build_kind: "helix".to_string(),
+            build_seq: "AKLTYWDSHEAA".to_string(),
+            sym_cutoff_a: 5.0,
+            vop_zone_rad: 5.0,
         };
 
         if let Some(bundle_path) = startup.dock_bundle {
@@ -657,7 +681,7 @@ impl eframe::App for BiomolCraftApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(
-                            "BiomolCraft v0.5.0 · SSAO · Measure · PAE · Morph · ViewDockX",
+                            "BiomolCraft v0.6.0 · SSAO · swapna/tug · Sym/SNFG · vop · ViewDockX",
                         )
                         .strong()
                         .color(egui::Color32::from_rgb(56, 189, 248)),
@@ -933,6 +957,18 @@ impl eframe::App for BiomolCraftApp {
                                 "ChimeraX Depth Silhouettes",
                             )
                             .changed()
+                        || ui
+                            .checkbox(
+                                &mut self.session.render_opts.show_snfg_glycans,
+                                "3D SNFG Glycans (NAG/MAN/FUC)",
+                            )
+                            .changed()
+                        || ui
+                            .checkbox(
+                                &mut self.session.render_opts.show_unit_cell,
+                                "Unit Cell Box (CRYST1)",
+                            )
+                            .changed()
                     {
                         self.session.dirty_geometry = true;
                         self.sync_viewport_scene();
@@ -1068,6 +1104,7 @@ impl eframe::App for BiomolCraftApp {
                         (RightModuleTab::Measure, "Measure"),
                         (RightModuleTab::MsaPae, "MSA / PAE"),
                         (RightModuleTab::MovieMorph, "Movie / Morph"),
+                        (RightModuleTab::SymGlycans, "Sym / SNFG"),
                         (RightModuleTab::Modeling, "Model 3D"),
                         (RightModuleTab::Physics, "Physics"),
                         (RightModuleTab::CryoEm, "Cryo-EM"),
@@ -1088,6 +1125,7 @@ impl eframe::App for BiomolCraftApp {
                     RightModuleTab::Measure => self.ui_measure_module(ui),
                     RightModuleTab::MsaPae => self.ui_msa_pae_module(ui),
                     RightModuleTab::MovieMorph => self.ui_movie_morph_module(ui),
+                    RightModuleTab::SymGlycans => self.ui_sym_glycans_module(ui),
                     RightModuleTab::Modeling => self.ui_modeling_module(ui),
                     RightModuleTab::Physics => self.ui_physics_module(ui),
                     RightModuleTab::CryoEm => self.ui_cryoem_module(ui),
@@ -1421,11 +1459,99 @@ impl BiomolCraftApp {
             if ui.button("Minimize Local MM (80 steps)").clicked() {
                 self.run_dsl("minimize 80");
             }
+            if ui.button("AddH (pH 7.4)").clicked() {
+                self.run_dsl("addh 7.4");
+            }
             if ui.button("Undo").clicked() {
                 self.run_dsl("undo");
             }
             if ui.button("Redo").clicked() {
                 self.run_dsl("redo");
+            }
+        });
+
+        ui.separator();
+        ui.strong("3D RNA/DNA Mutagenesis (swapna)");
+        ui.horizontal(|ui| {
+            ui.label(format!("Target {}:{}:", self.mut_chain, self.mut_res_seq));
+            for b in ['A', 'U', 'G', 'C', 'T'] {
+                ui.selectable_value(&mut self.swapna_base, b, b.to_string());
+            }
+            if ui.small_button("Apply swapna").clicked() {
+                let cmd = format!(
+                    "swapna {}:{} {}",
+                    self.mut_chain, self.mut_res_seq, self.swapna_base
+                );
+                self.run_dsl(&cmd);
+            }
+        });
+
+        ui.separator();
+        ui.strong("Bond Torsion Rotation (bond_rot) & Tug Sculpting");
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.bond_rot_atom_a).desired_width(82.0));
+            ui.label("—");
+            ui.add(egui::TextEdit::singleline(&mut self.bond_rot_atom_b).desired_width(82.0));
+            ui.add(
+                egui::DragValue::new(&mut self.bond_rot_deg)
+                    .range(-180.0..=180.0)
+                    .suffix("°"),
+            );
+            if ui.small_button("Rotate").clicked() {
+                let cmd = format!(
+                    "bond_rot {} {} {:.1}",
+                    self.bond_rot_atom_a, self.bond_rot_atom_b, self.bond_rot_deg
+                );
+                self.run_dsl(&cmd);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Tug:");
+            ui.add(egui::TextEdit::singleline(&mut self.tug_atom_spec).desired_width(82.0));
+            for (k, lbl) in ["dX", "dY", "dZ"].iter().enumerate() {
+                ui.add(
+                    egui::DragValue::new(&mut self.tug_shift[k])
+                        .speed(0.1)
+                        .range(-5.0..=5.0)
+                        .prefix(*lbl),
+                );
+            }
+            if ui.small_button("Pull").clicked() {
+                let cmd = format!(
+                    "tug {} {:.2} {:.2} {:.2}",
+                    self.tug_atom_spec, self.tug_shift[0], self.tug_shift[1], self.tug_shift[2]
+                );
+                self.run_dsl(&cmd);
+            }
+        });
+
+        ui.separator();
+        ui.strong("3D Structure Builder (Peptide Helix/Sheet · A-RNA Duplex)");
+        ui.horizontal(|ui| {
+            for k in ["helix", "sheet", "extended", "rna"] {
+                ui.selectable_value(&mut self.build_kind, k.to_string(), k);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.build_seq)
+                    .desired_width(210.0)
+                    .hint_text("AA or RNA sequence..."),
+            );
+            if ui.small_button("Build 3D").clicked() {
+                let cmd = format!("build {} {}", self.build_kind, self.build_seq);
+                self.run_dsl(&cmd);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.small_button("Altlocs Audit").clicked() {
+                self.run_dsl("altlocs");
+            }
+            if ui.small_button("Combine Visible Models").clicked() {
+                self.run_dsl("combine");
+            }
+            if ui.small_button("Delete Waters").clicked() {
+                self.run_dsl("delete water");
             }
         });
     }
@@ -1674,6 +1800,51 @@ impl BiomolCraftApp {
                 self.run_dsl("fitmap");
             }
         });
+        ui.separator();
+        ui.strong("Volumetric Operations (vop & Orthoplanes)");
+        ui.horizontal_wrapped(|ui| {
+            if ui.small_button("vop Gaussian (1.8 Å)").clicked() {
+                self.run_dsl("vop gaussian 1.8");
+            }
+            if ui.small_button("vop Sharpen").clicked() {
+                self.run_dsl("vop sharpen 1.2");
+            }
+            if ui.small_button("Hide Dust").clicked() {
+                self.run_dsl("vop hide_dust 12");
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Zone Radius (Å):");
+            ui.add(
+                egui::DragValue::new(&mut self.vop_zone_rad)
+                    .range(2.0..=20.0)
+                    .speed(0.5),
+            );
+            if ui.small_button("Carve Volume Zone").clicked() {
+                let r = self.vop_zone_rad;
+                self.run_dsl(&format!("vop zone {r:.1}"));
+            }
+        });
+        let mut ortho_dirty = ui
+            .checkbox(
+                &mut self.session.show_orthoplanes,
+                "Show XY / XZ / YZ Orthoplanes",
+            )
+            .changed();
+        if self.session.show_orthoplanes {
+            for (k, lbl) in ["X Slice", "Y Slice", "Z Slice"].iter().enumerate() {
+                ortho_dirty |= ui
+                    .add(
+                        egui::Slider::new(&mut self.session.orthoplane_frac[k], 0.05..=0.95)
+                            .text(*lbl),
+                    )
+                    .changed();
+            }
+        }
+        if ortho_dirty {
+            self.session.dirty_geometry = true;
+            self.sync_viewport_scene();
+        }
         ui.small(
             "Load external `.mrc`/`.map`/`.dx` volumes via DSL: `open_map /path/to/map.mrc 1.5`",
         );
@@ -2219,6 +2390,66 @@ impl BiomolCraftApp {
             "Tip: Save 2+ Scenes (Shift+F1, Shift+F2) then select 'fly' for smooth camera flights!",
         );
     }
+
+    fn ui_sym_glycans_module(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Crystallographic Symmetry & 3D SNFG Glycans");
+        if let Some(mol) = self.session.active_molecule() {
+            if let Some(ref uc) = mol.unit_cell {
+                ui.strong(format!("CRYST1 Space Group: {}", uc.space_group));
+                ui.small(format!(
+                    "a={:.2} Å · b={:.2} Å · c={:.2} Å | α={:.1}° β={:.1}° γ={:.1}°",
+                    uc.a, uc.b, uc.c, uc.alpha_deg, uc.beta_deg, uc.gamma_deg
+                ));
+            } else {
+                ui.small("No CRYST1 unit-cell metadata in active model.");
+            }
+            ui.small(format!(
+                "REMARK 350 BIOMT ops: {} | AltLoc records: {}",
+                mol.biomt_ops.len(),
+                mol.altlocs.len()
+            ));
+        }
+        ui.horizontal(|ui| {
+            ui.label("Symexp Cutoff (Å):");
+            ui.add(
+                egui::DragValue::new(&mut self.sym_cutoff_a)
+                    .range(2.0..=20.0)
+                    .speed(0.5),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Bio-Assembly (sym)").clicked() {
+                self.run_dsl("sym");
+            }
+            if ui.button("Crystal Mates (symexp)").clicked() {
+                let c = self.sym_cutoff_a;
+                self.run_dsl(&format!("symexp {c:.1}"));
+            }
+            if ui.button("Crystal Contacts").clicked() {
+                let c = self.sym_cutoff_a;
+                self.run_dsl(&format!("crystalcontacts {c:.1}"));
+            }
+            if ui.button("Unit Cell On/Off").clicked() {
+                let next = !self.session.render_opts.show_unit_cell;
+                self.run_dsl(if next { "unitcell on" } else { "unitcell off" });
+            }
+        });
+
+        ui.separator();
+        ui.strong("3D SNFG Glycans (GlcNAc Cubes · Man Spheres · Fuc Cones)");
+        ui.horizontal(|ui| {
+            if ui.button("Detect & Show SNFG 3D Glycans").clicked() {
+                self.run_dsl("snfg on");
+            }
+            if ui.small_button("Hide SNFG").clicked() {
+                self.run_dsl("snfg off");
+            }
+        });
+        if !self.session.last_module_markdown.is_empty() {
+            ui.separator();
+            ui.monospace(&self.session.last_module_markdown);
+        }
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -2228,7 +2459,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1520.0, 920.0])
             .with_title(
-                "BiomolCraft v0.5.0 — CraftBio Biomolecular 3D Studio, PAE, Morph & ViewDockX",
+                "BiomolCraft v0.6.0 — CraftBio Biomolecular 3D Studio, SNFG, Sym, vop & ViewDockX",
             ),
         ..Default::default()
     };

@@ -10,7 +10,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use biomol_model::{
-    audit_structure_prep, minimize_local_mm, mutate_and_repack_best_rotamer, mutate_residue_3d,
+    add_polar_hydrogens_ph, audit_structure_prep, build_de_novo_peptide_3d,
+    build_de_novo_rna_helix_3d, combine_biomolecules, delete_atoms_by_mask, minimize_local_mm,
+    mutate_and_repack_best_rotamer, mutate_residue_3d, rename_chain, renumber_chain,
+    rotate_bond_torsion, swapna_nucleotide_3d, tug_atom_with_sculpting,
 };
 use biomol_modules::{
     run_adc_module, run_antibody_module, run_cryoem_molmap_module, run_cryoem_volume_module,
@@ -28,17 +31,18 @@ use craftbio_scene::{
 use craftbio_struct::{
     Biomolecule, GeometryAxis, GeometryPlane, MsaAlignment, PaeMatrix, ResidueClass, VolumeGrid3D,
     axis_angle_deg, build_synchronized_msa, cealign_superpose, compute_best_fit_plane,
-    compute_geometry_axis, detect_clashes, detect_contacts, detect_hbonds,
-    estimate_pae_proxy_from_structure, evaluate_selection, load_dcd_frames, matchmaker_align,
-    measure_angle_deg, measure_dihedral_deg, measure_distance, morph_biomolecules, parse_dx_map,
-    parse_mrc_map, parse_pae_json, parse_sdf_poses, parse_structure_auto, write_mmcif,
-    write_multi_model_pdb, write_pdb,
+    compute_geometry_axis, detect_clashes, detect_contacts, detect_hbonds, detect_snfg_glycans,
+    estimate_pae_proxy_from_structure, evaluate_selection, generate_biological_assembly,
+    generate_crystal_mates, load_dcd_frames, matchmaker_align, measure_angle_deg,
+    measure_dihedral_deg, measure_distance, morph_biomolecules, parse_dx_map, parse_mrc_map,
+    parse_pae_json, parse_sdf_poses, parse_structure_auto, write_mmcif, write_multi_model_pdb,
+    write_pdb,
 };
 use craftbio_viewport::{
-    Camera3D, CapsuleInstance, RenderOptions, RenderSceneData, SphereInstance, build_render_scene,
-    extract_isosurface_mesh, push_grid_box_wireframe, render_fly_frames, render_rock_frames,
-    render_scene_png_bytes, render_scene_rgba, render_turntable_frames, write_movie_file,
-    write_scene_png,
+    Camera3D, CapsuleInstance, RenderOptions, RenderSceneData, SphereInstance,
+    build_orthoplanes_mesh, build_render_scene, extract_isosurface_mesh, push_grid_box_wireframe,
+    render_fly_frames, render_rock_frames, render_scene_png_bytes, render_scene_rgba,
+    render_turntable_frames, write_movie_file, write_scene_png,
 };
 pub use fetch::{FetchedAsset, fetch_structure_spec};
 use serde::{Deserialize, Serialize};
@@ -138,6 +142,8 @@ pub struct BiomolSession {
     pub active_volume: Option<VolumeGrid3D>,
     pub active_volume_sigma: f64,
     pub volume_wireframe: bool,
+    pub show_orthoplanes: bool,
+    pub orthoplane_frac: [f32; 3],
     pub camera: Camera3D,
     /// Global viewport rendering defaults & active model mirror (`representation`, `color_scheme`, etc.).
     pub render_opts: RenderOptions,
@@ -168,6 +174,8 @@ impl Default for BiomolSession {
             active_volume: None,
             active_volume_sigma: 1.5,
             volume_wireframe: false,
+            show_orthoplanes: false,
+            orthoplane_frac: [0.5, 0.5, 0.5],
             camera: Camera3D::default(),
             render_opts: RenderOptions::default(),
             named_selections: HashMap::new(),
@@ -228,6 +236,8 @@ impl BiomolSession {
             m.render_opts.line_overlays = g.line_overlays;
             m.render_opts.selected_atoms = g.selected_atoms;
             m.render_opts.grid_box = g.grid_box;
+            m.render_opts.show_snfg_glycans = g.show_snfg_glycans;
+            m.render_opts.show_unit_cell = g.show_unit_cell;
         }
     }
 
@@ -640,7 +650,7 @@ impl BiomolSession {
             scene.merge_from(build_render_scene(&m.molecule, &opts));
         }
 
-        // Volumetric Cryo-EM / APBS Marching-Tetrahedra isosurface mesh
+        // Volumetric Cryo-EM / APBS Marching-Tetrahedra isosurface mesh + optional Orthoplanes
         if let Some(ref vol) = self.active_volume {
             let iso = (vol.mean + self.active_volume_sigma * vol.std_dev) as f32;
             let vol_mesh = extract_isosurface_mesh(
@@ -653,6 +663,12 @@ impl BiomolSession {
             );
             if !vol_mesh.indices.is_empty() {
                 scene.transparent_meshes.push(vol_mesh);
+            }
+            if self.show_orthoplanes {
+                let ortho = build_orthoplanes_mesh(vol, self.orthoplane_frac, 0.56);
+                if !ortho.indices.is_empty() {
+                    scene.transparent_meshes.push(ortho);
+                }
             }
         }
 
@@ -2885,6 +2901,451 @@ impl BiomolSession {
                     out_path.display()
                 ))
             }
+            "swapna" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                if toks.len() < 2 {
+                    return Err(ScriptError::Command(
+                        "usage: swapna <CHAIN:RESSEQ> <A|U|G|C|T>".to_string(),
+                    ));
+                }
+                let (c_s, r_s) = toks[0].split_once(':').ok_or_else(|| {
+                    ScriptError::Command("expected CHAIN:RESSEQ (e.g. X:15)".to_string())
+                })?;
+                let ch = c_s
+                    .chars()
+                    .next()
+                    .ok_or_else(|| ScriptError::Command("missing chain id".to_string()))?;
+                let rseq: i32 = r_s
+                    .parse()
+                    .map_err(|_| ScriptError::Command("bad residue number".to_string()))?;
+                let base = toks[1]
+                    .chars()
+                    .next()
+                    .ok_or_else(|| ScriptError::Command("missing target base".to_string()))?;
+                self.push_undo_snapshot();
+                let mol = self
+                    .active_molecule_mut()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let rep = swapna_nucleotide_3d(mol, ch, rseq, base)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                self.render_opts
+                    .residue_highlights
+                    .insert((ch, rseq), [0.16, 0.92, 0.64]);
+                self.render_opts
+                    .sphere_overlays
+                    .extend(rep.clash_overlays.clone());
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                let msg = format!(
+                    "swapna {ch}:{}{rseq}{} ({}): {} clashes, {} H-bonds, {} 3D base pairs total.",
+                    rep.wild_type,
+                    rep.mutant,
+                    if rep.is_dna { "DNA" } else { "RNA" },
+                    rep.clash_count,
+                    rep.hbond_count,
+                    rep.base_pairs_after
+                );
+                self.provenance.push(ProvenanceEntry {
+                    kind: ProvenanceKind::InteractiveEdit,
+                    source_app: "biomolcraft::swapna".to_string(),
+                    summary: msg.clone(),
+                });
+                Ok(msg)
+            }
+            "bond_rot" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                if toks.len() < 3 {
+                    return Err(ScriptError::Command(
+                        "usage: bond_rot <C:R:A1> <C:R:A2> <delta_deg>".to_string(),
+                    ));
+                }
+                let (ia, _, _) = self.resolve_atom_spec(toks[0])?;
+                let (ib, _, _) = self.resolve_atom_spec(toks[1])?;
+                let deg: f64 = toks[2]
+                    .parse()
+                    .map_err(|_| ScriptError::Command("bad angle degrees".to_string()))?;
+                self.push_undo_snapshot();
+                let mol = self
+                    .active_molecule_mut()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let rep = rotate_bond_torsion(mol, ia, ib, deg)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                self.dirty_geometry = true;
+                let msg = format!(
+                    "bond_rot {} by {:.1}° ({} atoms): {} clashes, {} H-bonds | local score {:.2} -> {:.2} kcal/mol.",
+                    rep.bond_label,
+                    rep.delta_deg,
+                    rep.rotated_atoms,
+                    rep.clash_count_after,
+                    rep.hbond_count_after,
+                    rep.local_score_before_kcal,
+                    rep.local_score_after_kcal
+                );
+                self.measurements_log.push(msg.clone());
+                Ok(msg)
+            }
+            "tug" | "sculpt" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                if toks.len() < 4 {
+                    return Err(ScriptError::Command(
+                        "usage: tug <C:R:A> <dx> <dy> <dz> [radius_a]".to_string(),
+                    ));
+                }
+                let (ia, _, _) = self.resolve_atom_spec(toks[0])?;
+                let dx: f64 = toks[1].parse().unwrap_or(0.0);
+                let dy: f64 = toks[2].parse().unwrap_or(0.0);
+                let dz: f64 = toks[3].parse().unwrap_or(0.0);
+                let rad: f64 = toks.get(4).and_then(|s| s.parse().ok()).unwrap_or(6.0);
+                self.push_undo_snapshot();
+                let mol = self
+                    .active_molecule_mut()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let rep = tug_atom_with_sculpting(mol, ia, [dx, dy, dz], rad, 35)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                self.dirty_geometry = true;
+                let msg = format!(
+                    "Tugged {} by {:.2} Å ({} sculpted atoms): MM E {:.1} -> {:.1} kcal/mol | ΔΔG_local {:+.2} kcal/mol.",
+                    rep.atom_label,
+                    rep.target_shift_a,
+                    rep.atoms_sculpted,
+                    rep.energy_before_kcal,
+                    rep.energy_after_kcal,
+                    rep.local_ddg_kcal
+                );
+                self.measurements_log.push(msg.clone());
+                Ok(msg)
+            }
+            "build" | "fab" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                if toks.len() < 2 {
+                    return Err(ScriptError::Command(
+                        "usage: build <helix|sheet|extended|rna> <SEQUENCE> [chain]".to_string(),
+                    ));
+                }
+                let kind = toks[0].to_ascii_lowercase();
+                let seq = toks[1];
+                let chain = toks
+                    .get(2)
+                    .and_then(|s| s.chars().next())
+                    .unwrap_or('A');
+                let mol = if kind == "rna" || kind == "duplex" {
+                    build_de_novo_rna_helix_3d(seq, chain)
+                } else {
+                    build_de_novo_peptide_3d(seq, &kind, chain)
+                }
+                .map_err(|e| ScriptError::Command(e.to_string()))?;
+                let msg = self.insert_model(mol, None, "built", false);
+                Ok(format!("Built 3D '{kind}' structure. {msg}"))
+            }
+            "addh" => {
+                let ph: f64 = rest.parse().unwrap_or(7.4);
+                self.push_undo_snapshot();
+                let mol = self
+                    .active_molecule_mut()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let rep = add_polar_hydrogens_ph(mol, ph);
+                self.dirty_geometry = true;
+                Ok(format!(
+                    "Added {} polar hydrogens at pH {:.1} (protonated HIS={}, ASP/GLU={}).",
+                    rep.hydrogens_added, rep.ph, rep.protonated_his, rep.protonated_asp_glu
+                ))
+            }
+            "altlocs" => {
+                let (n_alt, md) = {
+                    let mol = self
+                        .active_molecule()
+                        .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                    let mut md = format!(
+                        "## Alternate Conformations (`altlocs`)\n\nDetected **{}** atoms with multiple occupancies:\n\n",
+                        mol.altlocs.len()
+                    );
+                    for a in mol.altlocs.iter().take(40) {
+                        md.push_str(&format!(
+                            "- `{}:{}{}.{}`: {:?}\n",
+                            a.chain, a.res_name, a.res_seq, a.atom_name, a.alt_ids
+                        ));
+                    }
+                    (mol.altlocs.len(), md)
+                };
+                if n_alt == 0 {
+                    Ok("No alternate conformations (altlocs) detected in active structure.".to_string())
+                } else {
+                    self.last_module_markdown = md;
+                    Ok(format!(
+                        "Detected {n_alt} atoms with alternate conformations (altlocs)."
+                    ))
+                }
+            }
+            "renumber" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                if toks.len() < 2 {
+                    return Err(ScriptError::Command(
+                        "usage: renumber <chain> <start_res_seq>".to_string(),
+                    ));
+                }
+                let ch = toks[0]
+                    .chars()
+                    .next()
+                    .ok_or_else(|| ScriptError::Command("missing chain".to_string()))?;
+                let start: i32 = toks[1]
+                    .parse()
+                    .map_err(|_| ScriptError::Command("bad start residue number".to_string()))?;
+                self.push_undo_snapshot();
+                let mol = self
+                    .active_molecule_mut()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let cnt = renumber_chain(mol, ch, start)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                self.dirty_geometry = true;
+                Ok(format!("Renumbered {cnt} residues in chain {ch} starting at {start}."))
+            }
+            "changechains" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                if toks.len() < 2 {
+                    return Err(ScriptError::Command(
+                        "usage: changechains <old_chain> <new_chain>".to_string(),
+                    ));
+                }
+                let old_c = toks[0]
+                    .chars()
+                    .next()
+                    .ok_or_else(|| ScriptError::Command("missing old chain".to_string()))?;
+                let new_c = toks[1]
+                    .chars()
+                    .next()
+                    .ok_or_else(|| ScriptError::Command("missing new chain".to_string()))?;
+                self.push_undo_snapshot();
+                let mol = self
+                    .active_molecule_mut()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let moved = rename_chain(mol, old_c, new_c)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                self.dirty_geometry = true;
+                Ok(format!("Renamed chain {old_c} -> {new_c} ({moved} atoms)."))
+            }
+            "combine" => {
+                let (n_vis, combined) = {
+                    let vis: Vec<&Biomolecule> = self
+                        .models
+                        .iter()
+                        .filter(|m| m.visible)
+                        .map(|m| &m.molecule)
+                        .collect();
+                    if vis.len() < 2 {
+                        return Err(ScriptError::Command(
+                            "combine requires at least 2 visible loaded models".to_string(),
+                        ));
+                    }
+                    let name = if rest.is_empty() { "combined" } else { rest };
+                    let comb = combine_biomolecules(&vis, name)
+                        .map_err(|e| ScriptError::Command(e.to_string()))?;
+                    (vis.len(), comb)
+                };
+                let msg = self.insert_model(combined, None, "combined", false);
+                Ok(format!("Combined {n_vis} models. {msg}"))
+            }
+            "delete" => {
+                if rest.is_empty() {
+                    return Err(ScriptError::Command(
+                        "usage: delete <selection_expr> (e.g. `delete water` or `delete chain C`)"
+                            .to_string(),
+                    ));
+                }
+                let mask = {
+                    let mol = self
+                        .active_molecule()
+                        .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                    evaluate_selection(mol, rest, &self.named_selections)
+                        .map_err(|e| ScriptError::Command(e.to_string()))?
+                };
+                self.push_undo_snapshot();
+                let mol = self
+                    .active_molecule_mut()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let del = delete_atoms_by_mask(mol, &mask)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                self.render_opts.selected_atoms.clear();
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                Ok(format!("Deleted {del} atoms matching '{rest}'."))
+            }
+            "sym" => {
+                let mol = self
+                    .active_molecule()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?
+                    .clone();
+                let bio = generate_biological_assembly(&mol)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                let copies = mol.biomt_ops.len();
+                let msg = self.insert_model(bio, None, "bioassembly", false);
+                Ok(format!("Generated Biological Assembly ({copies} BIOMT ops). {msg}"))
+            }
+            "symexp" | "crystalcontacts" => {
+                let cut: f64 = rest.parse().unwrap_or(5.0);
+                let mol = self
+                    .active_molecule()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?
+                    .clone();
+                let (mates, contacts) = generate_crystal_mates(&mol, cut)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                let n_mates = mates.len();
+                if cmd == "symexp" {
+                    for (_, mate) in mates {
+                        let _ = self.insert_model(mate, None, "symmate", false);
+                    }
+                    self.render_opts.show_unit_cell = true;
+                    self.sync_active_render_opts();
+                    self.focus_camera_all_visible();
+                }
+                self.dirty_geometry = true;
+                Ok(format!(
+                    "{cmd}: {n_mates} crystallographic symmetry mate(s) within {cut:.1} Å ({contacts} sampled crystal contact pairs <= 4.0 Å)."
+                ))
+            }
+            "unitcell" => {
+                let on = !matches!(rest.to_ascii_lowercase().as_str(), "off" | "false" | "0");
+                self.render_opts.show_unit_cell = on;
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                let info = self
+                    .active_molecule()
+                    .and_then(|m| m.unit_cell.as_ref())
+                    .map_or_else(
+                        || "no CRYST1 metadata".to_string(),
+                        |u| {
+                            format!(
+                                "a={:.2} b={:.2} c={:.2} Å ({:.0}/{:.0}/{:.0}°, {})",
+                                u.a, u.b, u.c, u.alpha_deg, u.beta_deg, u.gamma_deg, u.space_group
+                            )
+                        },
+                    );
+                Ok(format!("Crystallographic Unit Cell wireframe: {on} ({info})."))
+            }
+            "snfg" | "glycans" => {
+                let on = !matches!(rest.to_ascii_lowercase().as_str(), "off" | "false" | "0");
+                self.render_opts.show_snfg_glycans = on;
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                let rep = self
+                    .active_molecule()
+                    .map(detect_snfg_glycans)
+                    .unwrap_or_default();
+                let mut md = format!(
+                    "## 3D SNFG Glycans (`snfg`)\n\nDetected **{}** monosaccharide ring(s) and **{}** glycosidic / N-/O-glycan link(s):\n\n",
+                    rep.nodes.len(),
+                    rep.links.len()
+                );
+                for n in &rep.nodes {
+                    md.push_str(&format!(
+                        "- `{}:{}{}` -> **{}** (`{:?}`)\n",
+                        n.chain, n.res_name, n.res_seq, n.canonical_name, n.shape
+                    ));
+                }
+                for l in &rep.links {
+                    md.push_str(&format!("- Link: `{}`\n", l.label));
+                }
+                self.last_module_markdown = md;
+                Ok(format!(
+                    "SNFG 3D Glycans: {on} ({} glycans, {} glycosidic/Asn links).",
+                    rep.nodes.len(),
+                    rep.links.len()
+                ))
+            }
+            "vop" | "volume" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                let sub = toks.first().copied().unwrap_or("").to_ascii_lowercase();
+                if sub == "orthoplanes" || sub == "ortho" {
+                    let on = !matches!(
+                        toks.get(1).copied().unwrap_or("on").to_ascii_lowercase().as_str(),
+                        "off" | "false" | "0"
+                    );
+                    self.show_orthoplanes = on;
+                    self.dirty_geometry = true;
+                    return Ok(format!("Volumetric Orthoplanes (XY/XZ/YZ): {on}."));
+                }
+                let grid = self.active_volume.clone().ok_or_else(|| {
+                    ScriptError::Command(
+                        "no active volume map (run `molmap` or `open_map` first)".to_string(),
+                    )
+                })?;
+                match sub.as_str() {
+                    "gaussian" | "smooth" => {
+                        let sig: f64 = toks.get(1).and_then(|s| s.parse().ok()).unwrap_or(1.8);
+                        let g = grid
+                            .volume_gaussian(sig)
+                            .map_err(|e| ScriptError::Command(e.to_string()))?;
+                        let lbl = g.label.clone();
+                        self.active_volume = Some(g);
+                        self.dirty_geometry = true;
+                        Ok(format!("Applied vop gaussian ({sig:.1} Å) -> '{lbl}'."))
+                    }
+                    "sharpen" | "bfactor" => {
+                        let amt: f64 = toks.get(1).and_then(|s| s.parse().ok()).unwrap_or(1.2);
+                        let s = grid
+                            .volume_sharpen(amt)
+                            .map_err(|e| ScriptError::Command(e.to_string()))?;
+                        let lbl = s.label.clone();
+                        self.active_volume = Some(s);
+                        self.dirty_geometry = true;
+                        Ok(format!("Applied vop sharpen (amount={amt:.2}) -> '{lbl}'."))
+                    }
+                    "zone" | "carve" => {
+                        let rad: f64 = toks.get(1).and_then(|s| s.parse().ok()).unwrap_or(5.0);
+                        let centers: Vec<[f64; 3]> = self
+                            .active_molecule()
+                            .map(|mol| {
+                                let sel: Vec<[f64; 3]> = self
+                                    .render_opts
+                                    .selected_atoms
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|&(_, &s)| s)
+                                    .filter_map(|(i, _)| mol.atoms.get(i).map(|a| a.coords))
+                                    .collect();
+                                if !sel.is_empty() {
+                                    sel
+                                } else {
+                                    let lig: Vec<[f64; 3]> = mol
+                                        .atoms
+                                        .iter()
+                                        .filter(|a| a.res_class == ResidueClass::Ligand)
+                                        .map(|a| a.coords)
+                                        .collect();
+                                    if !lig.is_empty() {
+                                        lig
+                                    } else {
+                                        mol.atoms.iter().step_by(4).map(|a| a.coords).collect()
+                                    }
+                                }
+                            })
+                            .unwrap_or_default();
+                        let zoned = grid
+                            .volume_zone(&centers, rad)
+                            .map_err(|e| ScriptError::Command(e.to_string()))?;
+                        let lbl = zoned.label.clone();
+                        self.active_volume = Some(zoned);
+                        self.dirty_geometry = true;
+                        Ok(format!(
+                            "Carved volume zone within {rad:.1} Å of {} anchor atoms -> '{lbl}'.",
+                            centers.len()
+                        ))
+                    }
+                    "hide_dust" | "dust" | "hidedust" => {
+                        let min_v: usize = toks.get(1).and_then(|s| s.parse().ok()).unwrap_or(12);
+                        let (cleaned, removed) = grid
+                            .volume_hide_dust(self.active_volume_sigma, min_v)
+                            .map_err(|e| ScriptError::Command(e.to_string()))?;
+                        self.active_volume = Some(cleaned);
+                        self.dirty_geometry = true;
+                        Ok(format!(
+                            "vop hide_dust (min_voxels={min_v}): suppressed {removed} noise island(s)."
+                        ))
+                    }
+                    other => Err(ScriptError::Command(format!(
+                        "unknown vop subcommand '{other}' (use gaussian|sharpen|zone|hide_dust|orthoplanes)"
+                    ))),
+                }
+            }
             "undo" => {
                 if let Some(m) = self.active_model_mut()
                     && let Some(prev) = m.undo_stack.pop()
@@ -3094,6 +3555,27 @@ $$$$
         let raw = std::fs::read(&gif_path)?;
         assert_eq!(&raw[..6], b"GIF89a");
         let _ = std::fs::remove_file(&gif_path);
+        Ok(())
+    }
+
+    #[test]
+    fn wave6_swapna_build_sym_snfg_and_vop_dsl() -> Result<(), Box<dyn std::error::Error>> {
+        let mut sess = BiomolSession::default();
+        let b_rna = sess.execute_dsl("build rna GCGCUA A")?;
+        assert!(b_rna.contains("Built 3D 'rna'"));
+        let sw = sess.execute_dsl("swapna A:1 A")?;
+        assert!(sw.contains("swapna A:G1A"));
+
+        let b_pep = sess.execute_dsl("build helix AKLTYWDS H")?;
+        assert!(b_pep.contains("Built 3D 'helix'"));
+        let ah = sess.execute_dsl("addh 7.4")?;
+        assert!(ah.contains("Added"));
+
+        let _ = sess
+            .execute_dsl("molmap 4.0 1.5; vop sharpen 1.2; vop hide_dust 4; vop orthoplanes on")?;
+        assert!(sess.show_orthoplanes);
+        let sc = sess.build_viewport_scene();
+        assert!(sc.transparent_meshes.len() >= 2);
         Ok(())
     }
 }

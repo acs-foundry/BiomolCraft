@@ -289,6 +289,60 @@ impl Tools for BiomolTools {
                 ),
                 Effect::Files,
             ),
+            tool(
+                "swapna_nucleotide",
+                "3D RNA/DNA Nucleotide Mutagenesis (swapna)",
+                "Mutate an RNA or DNA nucleotide in 3D preserving ribose-phosphate backbone and planar base orientation, reporting clashes and 3D base pairs.",
+                object(
+                    json!({
+                        "chain": string("Nucleic acid chain ID, e.g. 'X'"),
+                        "res_seq": { "type": "integer", "description": "Nucleotide residue sequence number" },
+                        "target_base": string("Target base: A | U | G | C | T")
+                    }),
+                    &["chain", "res_seq", "target_base"],
+                ),
+                Effect::Edits,
+            ),
+            tool(
+                "build_structure_3d",
+                "De Novo 3D Peptide / RNA Duplex Builder",
+                "Build a de novo 3D alpha-helix, beta-sheet, extended peptide, or A-form RNA duplex and add it to the active multi-model scene.",
+                object(
+                    json!({
+                        "kind": string("helix | sheet | extended | rna"),
+                        "sequence": string("1-letter amino acid or RNA sequence"),
+                        "chain": string("Optional chain ID (default 'A')")
+                    }),
+                    &["kind", "sequence"],
+                ),
+                Effect::Edits,
+            ),
+            tool(
+                "symmetry_and_glycans",
+                "Symmetry (BIOMT/CRYST1) & 3D SNFG Glycans",
+                "Generate Biological Assemblies (sym), crystallographic symmetry mates (symexp), toggle Unit Cell wireframe, or detect & display 3D SNFG Glycans.",
+                object(
+                    json!({
+                        "action": string("sym | symexp | crystalcontacts | unitcell | snfg"),
+                        "cutoff_a": { "type": "number", "description": "Optional distance cutoff for symexp/crystalcontacts (default 5.0 A)" }
+                    }),
+                    &["action"],
+                ),
+                Effect::Edits,
+            ),
+            tool(
+                "volume_operations_vop",
+                "Cryo-EM Volumetric Operations (vop & Orthoplanes)",
+                "Apply vop gaussian, sharpen, zone (carve around site), hide_dust, or toggle XY/XZ/YZ Orthoplanes on the active volumetric map.",
+                object(
+                    json!({
+                        "op": string("gaussian | sharpen | zone | hide_dust | orthoplanes"),
+                        "param": { "type": "number", "description": "Sigma/amount/radius/min_voxels parameter (default 1.5)" }
+                    }),
+                    &["op"],
+                ),
+                Effect::Edits,
+            ),
         ]
     }
 
@@ -730,6 +784,64 @@ impl Tools for BiomolTools {
                     Err(e) => text_result(format!("sandbox write rejected: {e}"), true),
                 }
             }
+            "swapna_nucleotide" => {
+                let ch = args.get("chain").and_then(Value::as_str).unwrap_or("A");
+                let rseq = args.get("res_seq").and_then(Value::as_i64).unwrap_or(1);
+                let base = args
+                    .get("target_base")
+                    .and_then(Value::as_str)
+                    .unwrap_or("A");
+                match self
+                    .session
+                    .execute_dsl(&format!("swapna {ch}:{rseq} {base}"))
+                {
+                    Ok(msg) => text_result(msg, false),
+                    Err(e) => text_result(e.to_string(), true),
+                }
+            }
+            "build_structure_3d" => {
+                let kind = args.get("kind").and_then(Value::as_str).unwrap_or("helix");
+                let seq = args.get("sequence").and_then(Value::as_str).unwrap_or("");
+                let ch = args.get("chain").and_then(Value::as_str).unwrap_or("A");
+                match self
+                    .session
+                    .execute_dsl(&format!("build {kind} {seq} {ch}"))
+                {
+                    Ok(msg) => text_result(msg, false),
+                    Err(e) => text_result(e.to_string(), true),
+                }
+            }
+            "symmetry_and_glycans" => {
+                let act = args.get("action").and_then(Value::as_str).unwrap_or("snfg");
+                let cut = args.get("cutoff_a").and_then(Value::as_f64).unwrap_or(5.0);
+                let cmd = match act.to_ascii_lowercase().as_str() {
+                    "sym" => "sym".to_string(),
+                    "symexp" => format!("symexp {cut:.1}"),
+                    "crystalcontacts" => format!("crystalcontacts {cut:.1}"),
+                    "unitcell" => "unitcell on".to_string(),
+                    _ => "snfg on".to_string(),
+                };
+                match self.session.execute_dsl(&cmd) {
+                    Ok(msg) => text_result(
+                        format!("{msg}\n\n{}", self.session.last_module_markdown),
+                        false,
+                    ),
+                    Err(e) => text_result(e.to_string(), true),
+                }
+            }
+            "volume_operations_vop" => {
+                let op = args.get("op").and_then(Value::as_str).unwrap_or("sharpen");
+                let param = args.get("param").and_then(Value::as_f64).unwrap_or(1.5);
+                let cmd = if op.eq_ignore_ascii_case("orthoplanes") {
+                    "vop orthoplanes on".to_string()
+                } else {
+                    format!("vop {op} {param:.2}")
+                };
+                match self.session.execute_dsl(&cmd) {
+                    Ok(msg) => text_result(msg, false),
+                    Err(e) => text_result(e.to_string(), true),
+                }
+            }
             other => text_result(format!("unknown tool '{other}'"), true),
         }
     }
@@ -794,7 +906,7 @@ mod tests {
             .pointer("/result/tools")
             .and_then(Value::as_array)
             .ok_or("no tools")?;
-        assert_eq!(tools.len(), 21);
+        assert_eq!(tools.len(), 25);
 
         let rna = srv
             .handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fold_ncrna_mrna","arguments":{"preset":"guanine_riboswitch"}}}"#)
