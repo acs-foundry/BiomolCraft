@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 //! `biomolcraft` — Flagship Pure-Rust `wgpu 24 + egui` Multi-Model Biomolecular 3D Studio,
-//! Interactive Modeling Workbench, Native **`ViewDockX`** (`DockCraft` Craft Link v1), and
-//! Modular Biologics/ncRNA/Enzyme Design Suite (`v0.4.0`).
+//! Interactive Modeling Workbench, Native **`ViewDockX`** (`DockCraft` Craft Link v1),
+//! Chemical Measurements, MSA/PAE, Conformational Morphing & Movie Maker (`v0.5.0`).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -20,12 +20,26 @@ use craftbio_scene::{
     LightingPreset, RepresentationKind, discover_craft_instances,
 };
 use craftbio_struct::{ResidueClass, write_pdb};
-use craftbio_viewport::{SharedViewportScene, show_biomol_viewport};
+use craftbio_viewport::{
+    SharedViewportScene, pixels_per_angstrom_at_target, project_world_to_screen,
+    show_biomol_viewport,
+};
 use eframe::egui;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickMode {
+    Inspect,
+    Distance,
+    Angle,
+    Dihedral,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RightModuleTab {
     ViewDockX,
+    Measure,
+    MsaPae,
+    MovieMorph,
     Modeling,
     Physics,
     CryoEm,
@@ -107,6 +121,20 @@ pub struct BiomolCraftApp {
     adc_linker: String,
     adc_payload: String,
     adc_dar: f64,
+
+    // Wave 5: Interactive 3D Measurement Wizard, Overlays, PAE & Movie/Morph state
+    pick_mode: PickMode,
+    pick_buffer: Vec<usize>,
+    label2d_input: String,
+    scalebar_len_a: f32,
+    pae_json_input: String,
+    morph_frames: usize,
+    movie_mode: String,
+    movie_out_path: String,
+    movie_frames: usize,
+    movie_width: u32,
+    movie_height: u32,
+    movie_fps: u16,
 }
 
 impl Default for BiomolCraftApp {
@@ -136,7 +164,7 @@ impl BiomolCraftApp {
             fetch_id_input: "1CRN".to_string(),
             console_input: String::new(),
             console_log: vec![
-                "BiomolCraft v0.4.0 — Multi-Model wgpu Depth32F+SSAO Studio · Cartoon/SES Meshes · ViewDockX. Type 'help'.".to_string(),
+                "BiomolCraft v0.5.0 — Multi-Model wgpu Depth32F+SSAO Studio · Measure/Putty · MSA/PAE · Morph/Movie · ViewDockX. Type 'help'.".to_string(),
                 link_status.to_string(),
             ],
             picked_atom_info: "Click any atom/residue in 3D or sequence strip to inspect".to_string(),
@@ -164,6 +192,18 @@ impl BiomolCraftApp {
             adc_linker: "ggfg".to_string(),
             adc_payload: "dxd".to_string(),
             adc_dar: 8.0,
+            pick_mode: PickMode::Inspect,
+            pick_buffer: Vec::new(),
+            label2d_input: "BiomolCraft v0.5.0".to_string(),
+            scalebar_len_a: 20.0,
+            pae_json_input: String::new(),
+            morph_frames: 20,
+            movie_mode: "turn".to_string(),
+            movie_out_path: "/tmp/biomolcraft_movie.gif".to_string(),
+            movie_frames: 24,
+            movie_width: 800,
+            movie_height: 600,
+            movie_fps: 12,
         };
 
         if let Some(bundle_path) = startup.dock_bundle {
@@ -616,9 +656,11 @@ impl eframe::App for BiomolCraftApp {
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        egui::RichText::new("BiomolCraft v0.4.0 · Multi-Model · SSAO · ViewDockX")
-                            .strong()
-                            .color(egui::Color32::from_rgb(56, 189, 248)),
+                        egui::RichText::new(
+                            "BiomolCraft v0.5.0 · SSAO · Measure · PAE · Morph · ViewDockX",
+                        )
+                        .strong()
+                        .color(egui::Color32::from_rgb(56, 189, 248)),
                     );
                 });
             });
@@ -824,6 +866,7 @@ impl eframe::App for BiomolCraftApp {
                     ui.strong("Representation (Active Model)");
                     for r in [
                         RepresentationKind::Cartoon,
+                        RepresentationKind::Putty,
                         RepresentationKind::NucleicLadder,
                         RepresentationKind::Sticks,
                         RepresentationKind::Spheres,
@@ -1022,6 +1065,9 @@ impl eframe::App for BiomolCraftApp {
                 ui.horizontal_wrapped(|ui| {
                     for (t, lbl) in [
                         (RightModuleTab::ViewDockX, "ViewDockX"),
+                        (RightModuleTab::Measure, "Measure"),
+                        (RightModuleTab::MsaPae, "MSA / PAE"),
+                        (RightModuleTab::MovieMorph, "Movie / Morph"),
                         (RightModuleTab::Modeling, "Model 3D"),
                         (RightModuleTab::Physics, "Physics"),
                         (RightModuleTab::CryoEm, "Cryo-EM"),
@@ -1039,6 +1085,9 @@ impl eframe::App for BiomolCraftApp {
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| match self.right_tab {
                     RightModuleTab::ViewDockX => self.ui_viewdockx_module(ui),
+                    RightModuleTab::Measure => self.ui_measure_module(ui),
+                    RightModuleTab::MsaPae => self.ui_msa_pae_module(ui),
+                    RightModuleTab::MovieMorph => self.ui_movie_morph_module(ui),
                     RightModuleTab::Modeling => self.ui_modeling_module(ui),
                     RightModuleTab::Physics => self.ui_physics_module(ui),
                     RightModuleTab::CryoEm => self.ui_cryoem_module(ui),
@@ -1052,7 +1101,7 @@ impl eframe::App for BiomolCraftApp {
                 });
             });
 
-        // Center Primary 3D GPU Biomolecular Viewport (Offscreen Depth32Float + SSAO)
+        // Center Primary 3D GPU Biomolecular Viewport (Offscreen Depth32Float + SSAO + 2D/3D HUD)
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
@@ -1063,6 +1112,9 @@ impl eframe::App for BiomolCraftApp {
                     self.session.render_opts.show_silhouettes,
                     true,
                 );
+                // Paint live 3D/2D Labels, Color Key Legend & Calibrated Scale Bar directly over GPU viewport!
+                self.paint_viewport_hud(ui, resp.rect);
+
                 if resp.clicked()
                     && let Some(pos) = resp.interact_pointer_pos()
                     && let Some(mol) = self.session.active_molecule()
@@ -1079,6 +1131,57 @@ impl eframe::App for BiomolCraftApp {
                             "Picked {}:{}{}.{} ({}, B={:.1})",
                             a.chain, a.res_name, a.res_seq, a.name, a.element, a.b_factor
                         );
+                        match self.pick_mode {
+                            PickMode::Inspect => {}
+                            PickMode::Distance => {
+                                self.pick_buffer.push(ai);
+                                if self.pick_buffer.len() >= 2 {
+                                    let (p0, p1) = (self.pick_buffer[0], self.pick_buffer[1]);
+                                    self.pick_buffer.clear();
+                                    if let Ok(msg) = self.session.add_distance_measurement(p0, p1) {
+                                        self.console_log.push(msg.clone());
+                                        self.status_line = msg;
+                                        self.sync_viewport_scene();
+                                    }
+                                }
+                            }
+                            PickMode::Angle => {
+                                self.pick_buffer.push(ai);
+                                if self.pick_buffer.len() >= 3 {
+                                    let (p0, p1, p2) = (
+                                        self.pick_buffer[0],
+                                        self.pick_buffer[1],
+                                        self.pick_buffer[2],
+                                    );
+                                    self.pick_buffer.clear();
+                                    if let Ok(msg) = self.session.add_angle_measurement(p0, p1, p2)
+                                    {
+                                        self.console_log.push(msg.clone());
+                                        self.status_line = msg;
+                                        self.sync_viewport_scene();
+                                    }
+                                }
+                            }
+                            PickMode::Dihedral => {
+                                self.pick_buffer.push(ai);
+                                if self.pick_buffer.len() >= 4 {
+                                    let (p0, p1, p2, p3) = (
+                                        self.pick_buffer[0],
+                                        self.pick_buffer[1],
+                                        self.pick_buffer[2],
+                                        self.pick_buffer[3],
+                                    );
+                                    self.pick_buffer.clear();
+                                    if let Ok(msg) =
+                                        self.session.add_dihedral_measurement(p0, p1, p2, p3)
+                                    {
+                                        self.console_log.push(msg.clone());
+                                        self.status_line = msg;
+                                        self.sync_viewport_scene();
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -1657,6 +1760,465 @@ impl BiomolCraftApp {
             ));
         }
     }
+
+    fn paint_viewport_hud(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let painter = ui.painter_at(rect);
+        let w = rect.width().max(1.0) as u32;
+        let h = rect.height().max(1.0) as u32;
+        let pill_bg = egui::Color32::from_rgba_unmultiplied(14, 18, 28, 212);
+
+        // 1. Projected 3D Labels
+        for lbl in &self.session.labels_3d {
+            let p = [
+                lbl.coords[0] as f32,
+                lbl.coords[1] as f32,
+                lbl.coords[2] as f32,
+            ];
+            if let Some((sx, sy, _)) = project_world_to_screen(&self.session.camera, p, w, h) {
+                let pos = egui::pos2(rect.left() + sx + 6.0, rect.top() + sy - 14.0);
+                let col = egui::Color32::from_rgb(
+                    (lbl.rgba[0].clamp(0.0, 1.0) * 255.0) as u8,
+                    (lbl.rgba[1].clamp(0.0, 1.0) * 255.0) as u8,
+                    (lbl.rgba[2].clamp(0.0, 1.0) * 255.0) as u8,
+                );
+                let galley = painter.layout_no_wrap(
+                    lbl.text.clone(),
+                    egui::FontId::monospace(12.5 * lbl.font_scale.clamp(0.7, 2.0)),
+                    col,
+                );
+                let bg_rect = egui::Rect::from_min_size(
+                    pos - egui::vec2(5.0, 2.0),
+                    galley.size() + egui::vec2(10.0, 4.0),
+                );
+                painter.rect_filled(bg_rect, 4.0, pill_bg);
+                painter.galley(pos, galley, col);
+            }
+        }
+
+        // 2. 2D Screen-Space Labels
+        for lbl in &self.session.labels_2d {
+            let pos = egui::pos2(
+                rect.left() + lbl.norm_pos[0].clamp(0.02, 0.92) * rect.width(),
+                rect.top() + lbl.norm_pos[1].clamp(0.02, 0.92) * rect.height(),
+            );
+            let col = egui::Color32::from_rgb(
+                (lbl.rgba[0].clamp(0.0, 1.0) * 255.0) as u8,
+                (lbl.rgba[1].clamp(0.0, 1.0) * 255.0) as u8,
+                (lbl.rgba[2].clamp(0.0, 1.0) * 255.0) as u8,
+            );
+            let galley = painter.layout_no_wrap(
+                lbl.text.clone(),
+                egui::FontId::proportional(14.0 * lbl.font_scale.clamp(0.7, 2.5)),
+                col,
+            );
+            let bg_rect = egui::Rect::from_min_size(
+                pos - egui::vec2(6.0, 3.0),
+                galley.size() + egui::vec2(12.0, 6.0),
+            );
+            painter.rect_filled(bg_rect, 4.0, pill_bg);
+            painter.galley(pos, galley, col);
+        }
+
+        // 3. Publication Color Key Legend (bottom-left)
+        if let Some(ref key) = self.session.color_key
+            && key.stops.len() >= 2
+        {
+            let bar_w = (rect.width() * 0.24).clamp(150.0, 280.0);
+            let box_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 14.0, rect.bottom() - 64.0),
+                egui::vec2(bar_w + 20.0, 50.0),
+            );
+            painter.rect_filled(box_rect, 5.0, pill_bg);
+            painter.text(
+                box_rect.left_top() + egui::vec2(10.0, 6.0),
+                egui::Align2::LEFT_TOP,
+                &key.title,
+                egui::FontId::proportional(11.5),
+                egui::Color32::WHITE,
+            );
+            let segs = 32usize;
+            let bar_left = box_rect.left() + 10.0;
+            let bar_top = box_rect.top() + 22.0;
+            let step_w = bar_w / (segs as f32);
+            let stop_n = (key.stops.len() - 1) as f32;
+            for s in 0..segs {
+                let u = (s as f32) / ((segs - 1).max(1) as f32);
+                let fi = u * stop_n;
+                let idx = (fi.floor() as usize).min(key.stops.len() - 2);
+                let fr = fi - idx as f32;
+                let ca = key.stops[idx];
+                let cb = key.stops[idx + 1];
+                let col = egui::Color32::from_rgb(
+                    ((ca[0] + (cb[0] - ca[0]) * fr).clamp(0.0, 1.0) * 255.0) as u8,
+                    ((ca[1] + (cb[1] - ca[1]) * fr).clamp(0.0, 1.0) * 255.0) as u8,
+                    ((ca[2] + (cb[2] - ca[2]) * fr).clamp(0.0, 1.0) * 255.0) as u8,
+                );
+                let seg_r = egui::Rect::from_min_size(
+                    egui::pos2(bar_left + (s as f32) * step_w, bar_top),
+                    egui::vec2(step_w + 0.8, 10.0),
+                );
+                painter.rect_filled(seg_r, 0.0, col);
+            }
+            painter.text(
+                egui::pos2(bar_left, bar_top + 13.0),
+                egui::Align2::LEFT_TOP,
+                &key.min_label,
+                egui::FontId::monospace(10.5),
+                egui::Color32::LIGHT_GRAY,
+            );
+            painter.text(
+                egui::pos2(bar_left + bar_w, bar_top + 13.0),
+                egui::Align2::RIGHT_TOP,
+                &key.max_label,
+                egui::FontId::monospace(10.5),
+                egui::Color32::LIGHT_GRAY,
+            );
+        }
+
+        // 4. Calibrated Ångström Scale Bar (bottom-right)
+        if let Some(ref sb) = self.session.scale_bar {
+            let ppa = pixels_per_angstrom_at_target(&self.session.camera, h);
+            let bar_px = (sb.length_a.max(1.0) * ppa).clamp(48.0, rect.width() * 0.34);
+            let box_w = bar_px.max(76.0) + 20.0;
+            let box_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.right() - box_w - 14.0, rect.bottom() - 52.0),
+                egui::vec2(box_w, 38.0),
+            );
+            painter.rect_filled(box_rect, 5.0, pill_bg);
+            painter.text(
+                egui::pos2(box_rect.center().x, box_rect.top() + 5.0),
+                egui::Align2::CENTER_TOP,
+                &sb.label,
+                egui::FontId::monospace(11.5),
+                egui::Color32::WHITE,
+            );
+            let y = box_rect.bottom() - 10.0;
+            let x0 = box_rect.center().x - bar_px * 0.5;
+            let x1 = box_rect.center().x + bar_px * 0.5;
+            let stroke = egui::Stroke::new(2.5_f32, egui::Color32::WHITE);
+            painter.line_segment([egui::pos2(x0, y), egui::pos2(x1, y)], stroke);
+            painter.line_segment([egui::pos2(x0, y - 4.0), egui::pos2(x0, y + 4.0)], stroke);
+            painter.line_segment([egui::pos2(x1, y - 4.0), egui::pos2(x1, y + 4.0)], stroke);
+        }
+    }
+
+    fn ui_measure_module(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Chemical Analysis · 3D Measurements · Overlays");
+        ui.strong("3D Viewport Pick Mode (Click Atoms in 3D):");
+        ui.horizontal_wrapped(|ui| {
+            for (m, lbl) in [
+                (PickMode::Inspect, "Inspect"),
+                (PickMode::Distance, "Distance (2)"),
+                (PickMode::Angle, "Angle (3)"),
+                (PickMode::Dihedral, "Dihedral (4)"),
+            ] {
+                if ui.selectable_value(&mut self.pick_mode, m, lbl).clicked() {
+                    self.pick_buffer.clear();
+                }
+            }
+        });
+        if !self.pick_buffer.is_empty() {
+            ui.small(format!(
+                "Picked {} atom(s) — click remaining atom(s) in 3D viewport...",
+                self.pick_buffer.len()
+            ));
+        }
+
+        ui.separator();
+        ui.strong("Interactions & Geometry (ChimeraX / PyMOL)");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("H-Bonds (3.5 Å)").clicked() {
+                self.run_dsl("hbonds 3.5");
+            }
+            if ui.button("Steric Clashes").clicked() {
+                self.run_dsl("clashes 0.60");
+            }
+            if ui.button("Contacts (4.0 Å)").clicked() {
+                self.run_dsl("contacts 4.0");
+            }
+            if ui.button("Define Axis (PCA)").clicked() {
+                self.run_dsl("axis");
+            }
+            if ui.button("Define Plane (PCA)").clicked() {
+                self.run_dsl("plane");
+            }
+            if ui.button("Putty / Sausage Mode").clicked() {
+                self.run_dsl("putty on");
+            }
+            if ui.button("Clear Measurements").clicked() {
+                self.pick_buffer.clear();
+                self.run_dsl("measure clear");
+            }
+        });
+
+        ui.separator();
+        ui.strong("Publication Annotations (GUI + 4K PNG)");
+        ui.horizontal_wrapped(|ui| {
+            if ui.small_button("Key: Auto").clicked() {
+                self.run_dsl("key auto");
+            }
+            if ui.small_button("Key: ESP").clicked() {
+                self.run_dsl("key esp");
+            }
+            if ui.small_button("Key: MLP").clicked() {
+                self.run_dsl("key mlp");
+            }
+            if ui.small_button("Key: pLDDT").clicked() {
+                self.run_dsl("key plddt");
+            }
+            if ui.small_button("Key: Off").clicked() {
+                self.run_dsl("key off");
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Scale Bar (Å):");
+            ui.add(egui::DragValue::new(&mut self.scalebar_len_a).range(5.0..=100.0));
+            if ui.small_button("Show").clicked() {
+                let len = self.scalebar_len_a;
+                self.run_dsl(&format!("scalebar {len:.0}"));
+            }
+            if ui.small_button("Hide").clicked() {
+                self.run_dsl("scalebar off");
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.label2d_input)
+                    .desired_width(185.0)
+                    .hint_text("2D banner text..."),
+            );
+            if ui.small_button("+2D Label").clicked() {
+                let txt = self.label2d_input.clone();
+                if !txt.trim().is_empty() {
+                    self.run_dsl(&format!("2dlabel 0.03 0.03 {txt}"));
+                }
+            }
+            if ui.small_button("Clear Labels").clicked() {
+                self.run_dsl("label clear");
+            }
+        });
+
+        ui.separator();
+        ui.strong(format!(
+            "Measurements Log ({}):",
+            self.session.measurements_log.len()
+        ));
+        for line in self.session.measurements_log.iter().rev().take(15) {
+            ui.monospace(line);
+        }
+        if !self.session.last_module_markdown.is_empty() {
+            ui.separator();
+            ui.monospace(&self.session.last_module_markdown);
+        }
+    }
+
+    fn ui_msa_pae_module(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Synchronized MSA & Interactive 2D PAE Plot");
+        ui.horizontal(|ui| {
+            if ui.button("Build Synchronized MSA (All Models)").clicked() {
+                self.run_dsl("msa");
+            }
+            if ui.button("Estimate Structural PAE").clicked() {
+                self.run_dsl("pae auto");
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.pae_json_input)
+                    .desired_width(215.0)
+                    .hint_text("/path/to/alphafold_or_boltz_pae.json"),
+            );
+            if ui.small_button("Load PAE JSON").clicked() {
+                let p = self.pae_json_input.clone();
+                if !p.trim().is_empty() {
+                    self.run_dsl(&format!("pae {p}"));
+                }
+            }
+        });
+
+        // Synchronized clickable MSA rows
+        let mut msa_select: Option<(char, i32)> = None;
+        if let Some(ref msa) = self.session.msa {
+            ui.separator();
+            ui.strong(format!(
+                "Match→Align MSA ({} models × {} cols):",
+                msa.rows.len(),
+                msa.num_columns
+            ));
+            egui::ScrollArea::horizontal()
+                .id_salt("msa_scroll")
+                .max_height(130.0)
+                .show(ui, |ui| {
+                    for row in &msa.rows {
+                        ui.horizontal(|ui| {
+                            ui.monospace(format!(
+                                "{:<10}[{}]",
+                                row.model_name.chars().take(10).collect::<String>(),
+                                row.chain_id
+                            ));
+                            for (ci, &ch) in row.aligned_chars.iter().take(90).enumerate() {
+                                let cons = msa.column_conservation.get(ci).copied().unwrap_or(0.0);
+                                let col = if cons >= 0.99 {
+                                    egui::Color32::from_rgb(52, 211, 153)
+                                } else if cons >= 0.5 {
+                                    egui::Color32::from_rgb(250, 204, 21)
+                                } else {
+                                    egui::Color32::GRAY
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new(ch.to_string())
+                                                .monospace()
+                                                .color(col),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .clicked()
+                                    && let Some(rseq) = row.res_seqs.get(ci).copied().flatten()
+                                {
+                                    msa_select = Some((row.chain_id, rseq));
+                                }
+                            }
+                        });
+                    }
+                });
+        }
+        if let Some((ch, rs)) = msa_select {
+            self.run_dsl(&format!("select msa_col, chain {ch} and resi {rs}"));
+        }
+
+        // Interactive 2D AlphaFold / Boltz PAE Error Heatmap
+        let mut clicked_domain: Option<(usize, usize)> = None;
+        if let Some(ref pae) = self.session.pae {
+            ui.separator();
+            ui.strong(format!(
+                "2D PAE Matrix ({}×{}, mean {:.1} Å, {} domains — click to highlight in 3D):",
+                pae.length,
+                pae.length,
+                pae.mean_pae,
+                pae.domain_blocks.len()
+            ));
+            ui.horizontal_wrapped(|ui| {
+                for (di, &(s, e)) in pae.domain_blocks.iter().enumerate() {
+                    if ui
+                        .small_button(format!("Domain {} ({}–{})", di + 1, s + 1, e + 1))
+                        .clicked()
+                    {
+                        clicked_domain = Some((s, e));
+                    }
+                }
+            });
+
+            let side = 230.0_f32;
+            let (resp, painter) = ui.allocate_painter(egui::vec2(side, side), egui::Sense::click());
+            let rect = resp.rect;
+            let n = pae.length.max(1);
+            let bins = n.min(64);
+            let cell = side / (bins as f32);
+            let max_v = pae.max_pae.max(25.0);
+            for by in 0..bins {
+                let ry = (by * n) / bins;
+                for bx in 0..bins {
+                    let rx = (bx * n) / bins;
+                    let v = pae.values.get(ry * n + rx).copied().unwrap_or(max_v);
+                    // Classic AlphaFold green PAE palette: 0 A = dark emerald -> 30 A = white
+                    let t = (v / max_v).clamp(0.0, 1.0);
+                    let r = (12.0 + 240.0 * t) as u8;
+                    let g = (108.0 + 145.0 * t) as u8;
+                    let b = (68.0 + 184.0 * t) as u8;
+                    let c_rect = egui::Rect::from_min_size(
+                        egui::pos2(
+                            rect.left() + (bx as f32) * cell,
+                            rect.top() + (by as f32) * cell,
+                        ),
+                        egui::vec2(cell + 0.5, cell + 0.5),
+                    );
+                    painter.rect_filled(c_rect, 0.0, egui::Color32::from_rgb(r, g, b));
+                }
+            }
+            if resp.clicked()
+                && let Some(pos) = resp.interact_pointer_pos()
+            {
+                let rx = (((pos.x - rect.left()) / side).clamp(0.0, 0.999) * (n as f32)) as usize;
+                let ry = (((pos.y - rect.top()) / side).clamp(0.0, 0.999) * (n as f32)) as usize;
+                let span = 12usize;
+                clicked_domain = Some((
+                    rx.min(ry).saturating_sub(span),
+                    (rx.max(ry) + span).min(n - 1),
+                ));
+            }
+        }
+        if let Some((s, e)) = clicked_domain {
+            let msg = self.session.select_pae_domain(s, e);
+            self.console_log.push(msg.clone());
+            self.status_line = msg;
+            self.sync_viewport_scene();
+        }
+    }
+
+    fn ui_movie_morph_module(&mut self, ui: &mut egui::Ui) {
+        ui.heading("CEAlign · Conformational Morphing · Movie Maker");
+        ui.strong("Sequence-Independent Superposition & Morphing");
+        ui.horizontal(|ui| {
+            ui.label("Morph Frames:");
+            ui.add(egui::DragValue::new(&mut self.morph_frames).range(4..=60));
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("CEAlign #2 → #1 (0% Seq ID)").clicked() {
+                self.run_dsl("cealign #2:A #1:A");
+            }
+            if ui.button("Morph #1 ↔ #2 (SHAKE)").clicked() {
+                let f = self.morph_frames;
+                self.run_dsl(&format!("morph #1 #2 {f}"));
+                self.playing_trajectory = true;
+            }
+        });
+
+        ui.separator();
+        ui.strong("Movie Maker (Pure-Rust .gif & ffmpeg H.264 .mp4)");
+        ui.horizontal(|ui| {
+            ui.label("Mode:");
+            for m in ["turn", "rock", "fly", "morph"] {
+                ui.selectable_value(&mut self.movie_mode, m.to_string(), m);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Output:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.movie_out_path)
+                    .desired_width(235.0)
+                    .hint_text("/tmp/movie.gif or /tmp/movie.mp4"),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Frames:");
+            ui.add(egui::DragValue::new(&mut self.movie_frames).range(6..=120));
+            ui.label("FPS:");
+            ui.add(egui::DragValue::new(&mut self.movie_fps).range(4..=30));
+        });
+        ui.horizontal(|ui| {
+            ui.label("W:");
+            ui.add(egui::DragValue::new(&mut self.movie_width).range(240..=1920));
+            ui.label("H:");
+            ui.add(egui::DragValue::new(&mut self.movie_height).range(180..=1080));
+        });
+        if ui.button("Export Animated Movie (.gif / .mp4)").clicked() {
+            let cmd = format!(
+                "movie {} {} {} {} {} {}",
+                self.movie_mode,
+                self.movie_out_path,
+                self.movie_frames,
+                self.movie_width,
+                self.movie_height,
+                self.movie_fps
+            );
+            self.run_dsl(&cmd);
+        }
+        ui.small(
+            "Tip: Save 2+ Scenes (Shift+F1, Shift+F2) then select 'fly' for smooth camera flights!",
+        );
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -1665,7 +2227,9 @@ fn main() -> eframe::Result<()> {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1520.0, 920.0])
-            .with_title("BiomolCraft v0.4.0 — CraftBio Multi-Model 3D Studio & ViewDockX"),
+            .with_title(
+                "BiomolCraft v0.5.0 — CraftBio Biomolecular 3D Studio, PAE, Morph & ViewDockX",
+            ),
         ..Default::default()
     };
     eframe::run_native(

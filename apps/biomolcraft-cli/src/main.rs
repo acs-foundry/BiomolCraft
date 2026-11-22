@@ -33,8 +33,10 @@ use craftbio_scene::{
     send_trajectory_via_craft_link,
 };
 use craftbio_struct::{
-    load_dcd_frames, matchmaker_align, parse_dx_map, parse_mrc_map, parse_structure_auto,
-    write_mrc_map, write_multi_model_pdb, write_pdb,
+    cealign_superpose, detect_clashes, detect_contacts, detect_hbonds,
+    estimate_pae_proxy_from_structure, load_dcd_frames, matchmaker_align, morph_biomolecules,
+    parse_dx_map, parse_mrc_map, parse_pae_json, parse_structure_auto, write_mrc_map,
+    write_multi_model_pdb, write_pdb,
 };
 use craftbio_viewport::{render_scene_png_bytes, write_scene_png};
 
@@ -65,7 +67,7 @@ enum Commands {
         #[arg(
             long,
             default_value = "cartoon",
-            help = "cartoon | nucleic | sticks | spheres | surface | lines"
+            help = "cartoon | putty | nucleic | sticks | spheres | surface | lines"
         )]
         style: String,
         #[arg(
@@ -84,6 +86,18 @@ enum Commands {
             help = "Optional publication preset: pub_white | pub_dark | chimerax_soft | pymol_ray"
         )]
         preset: Option<String>,
+        #[arg(
+            long,
+            help = "Optional Color Key legend: auto | esp | mlp | sap | plddt"
+        )]
+        key: Option<String>,
+        #[arg(long, help = "Optional calibrated Ångström scale bar length (e.g. 20)")]
+        scalebar: Option<f32>,
+        #[arg(
+            long,
+            help = "Optional 2D title banner label burned into top-left of PNG"
+        )]
+        label_2d: Option<String>,
         #[arg(long)]
         surface: bool,
         #[arg(long)]
@@ -359,6 +373,105 @@ enum Commands {
         #[arg(long)]
         write_root: Option<PathBuf>,
     },
+    /// Chemical interaction & geometry audit (`hbonds`, `clashes`, `contacts`) with optional annotated PNG.
+    Measure {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long)]
+        hbonds: bool,
+        #[arg(long)]
+        clashes: bool,
+        #[arg(long)]
+        contacts: bool,
+        #[arg(long, default_value_t = 3.5)]
+        max_dist: f64,
+        #[arg(long, default_value_t = 0.60)]
+        clash_overlap: f64,
+        #[arg(long)]
+        putty: bool,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long)]
+        scalebar: Option<f32>,
+        #[arg(long)]
+        out_md: Option<PathBuf>,
+        #[arg(long)]
+        out_png: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Sequence-independent 3D Combinatorial Extension alignment (`cealign` / `super`, 0% seq identity needed).
+    Cealign {
+        #[arg(long)]
+        mobile: PathBuf,
+        #[arg(long, default_value_t = 'A')]
+        mobile_chain: char,
+        #[arg(long)]
+        target: PathBuf,
+        #[arg(long, default_value_t = 'A')]
+        target_chain: char,
+        #[arg(long)]
+        out_pdb: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Conformational Morphing between two structures (`morph`, Kabsch-aligned + SHAKE bond restoration).
+    Morph {
+        #[arg(long)]
+        from: PathBuf,
+        #[arg(long)]
+        to: PathBuf,
+        #[arg(long, default_value_t = 20)]
+        frames: usize,
+        #[arg(long)]
+        out_pdb: Option<PathBuf>,
+        #[arg(long)]
+        out_movie: Option<PathBuf>,
+        #[arg(long, default_value_t = 640)]
+        width: u32,
+        #[arg(long, default_value_t = 480)]
+        height: u32,
+        #[arg(long, default_value_t = 12)]
+        fps: u16,
+    },
+    /// Parse AlphaFold/Boltz-2/Chai-1 PAE JSON (or estimate structural PAE domain packing proxy).
+    Pae {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long)]
+        pae_json: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export an animated biomolecular movie (pure-Rust `.gif` or ffmpeg H.264 `.mp4`/`.webm`).
+    Movie {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long, default_value = "turn", help = "turn | rock | fly | morph")]
+        mode: String,
+        #[arg(long, help = "Optional second conformation PDB when --mode morph")]
+        to_pdb: Option<PathBuf>,
+        #[arg(long, default_value = "cartoon")]
+        style: String,
+        #[arg(long, default_value = "chain")]
+        color: String,
+        #[arg(long)]
+        preset: Option<String>,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long)]
+        scalebar: Option<f32>,
+        #[arg(long, default_value_t = 24)]
+        frames: usize,
+        #[arg(long, default_value_t = 640)]
+        width: u32,
+        #[arg(long, default_value_t = 480)]
+        height: u32,
+        #[arg(long, default_value_t = 12)]
+        fps: u16,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 fn write_text(path: &Path, text: &str) -> Result<(), String> {
@@ -411,6 +524,9 @@ fn run() -> Result<(), String> {
             color,
             module,
             preset,
+            key,
+            scalebar,
+            label_2d,
             surface,
             wireframe,
             ssao,
@@ -431,6 +547,21 @@ fn run() -> Result<(), String> {
             if let Some(p) = preset {
                 let _ = sess
                     .execute_dsl(&format!("preset {p}"))
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(k) = key {
+                let _ = sess
+                    .execute_dsl(&format!("key {k}"))
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(sb) = scalebar {
+                let _ = sess
+                    .execute_dsl(&format!("scalebar {sb:.1}"))
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(lbl) = label_2d {
+                let _ = sess
+                    .execute_dsl(&format!("2dlabel 0.03 0.03 {lbl}"))
                     .map_err(|e| e.to_string())?;
             }
             if wireframe {
@@ -1239,6 +1370,265 @@ fn run() -> Result<(), String> {
             let sbx = PathSandbox::new(read_root, write_root, DEFAULT_MAX_FILE_BYTES)
                 .map_err(|e| e.to_string())?;
             mcp::run_mcp_stdio(sbx)?;
+        }
+        Commands::Measure {
+            pdb,
+            hbonds,
+            clashes,
+            contacts,
+            max_dist,
+            clash_overlap,
+            putty,
+            key,
+            scalebar,
+            out_md,
+            out_png,
+            json,
+        } => {
+            let mut sess = BiomolSession::default();
+            sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+            let mol = sess.active_molecule().ok_or("no molecule")?.clone();
+            let do_all = !hbonds && !clashes && !contacts;
+            let hb_vec = if do_all || hbonds {
+                let _ = sess
+                    .execute_dsl(&format!("hbonds {max_dist:.2}"))
+                    .map_err(|e| e.to_string())?;
+                detect_hbonds(&mol, None, None, max_dist, 95.0)
+            } else {
+                Vec::new()
+            };
+            let cl_vec = if do_all || clashes {
+                let _ = sess
+                    .execute_dsl(&format!("clashes {clash_overlap:.2}"))
+                    .map_err(|e| e.to_string())?;
+                detect_clashes(&mol, None, None, clash_overlap)
+            } else {
+                Vec::new()
+            };
+            let ct_vec = if do_all || contacts {
+                let _ = sess
+                    .execute_dsl(&format!("contacts {:.2}", max_dist.max(4.0)))
+                    .map_err(|e| e.to_string())?;
+                detect_contacts(&mol, None, None, max_dist.max(4.0), 200)
+            } else {
+                Vec::new()
+            };
+            if putty {
+                let _ = sess.execute_dsl("putty on").map_err(|e| e.to_string())?;
+            }
+            if let Some(k) = key {
+                let _ = sess
+                    .execute_dsl(&format!("key {k}"))
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(sb) = scalebar {
+                let _ = sess
+                    .execute_dsl(&format!("scalebar {sb:.1}"))
+                    .map_err(|e| e.to_string())?;
+            }
+            let summary_md = format!(
+                "# BiomolCraft Chemical Measurement Audit: {}\n\n- **H-Bonds (<= {:.2} Å):** `{}`\n- **Steric Clashes (overlap >= {:.2} Å):** `{}`\n- **Inter-chain Contacts (<= {:.2} Å):** `{}`\n",
+                mol.title,
+                max_dist,
+                hb_vec.len(),
+                clash_overlap,
+                cl_vec.len(),
+                max_dist.max(4.0),
+                ct_vec.len()
+            );
+            if let Some(p) = out_md {
+                write_text(&p, &summary_md)?;
+            }
+            if let Some(p) = out_png {
+                let sc = sess.build_viewport_scene();
+                let bytes = write_scene_png(&sc, &sess.camera, 1600, 1200, false, &p)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "Rendered annotated measurement PNG -> {} ({bytes} bytes).",
+                    p.display()
+                );
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "structure": mol.title,
+                        "hbonds_count": hb_vec.len(),
+                        "clashes_count": cl_vec.len(),
+                        "contacts_count": ct_vec.len(),
+                        "top_hbonds": hb_vec.iter().take(15).collect::<Vec<_>>(),
+                        "top_clashes": cl_vec.iter().take(15).collect::<Vec<_>>(),
+                    }))
+                    .map_err(|e| e.to_string())?
+                );
+            } else {
+                print!("{summary_md}");
+            }
+        }
+        Commands::Cealign {
+            mobile,
+            mobile_chain,
+            target,
+            target_chain,
+            out_pdb,
+            json,
+        } => {
+            let m_raw = std::fs::read_to_string(&mobile).map_err(|e| e.to_string())?;
+            let t_raw = std::fs::read_to_string(&target).map_err(|e| e.to_string())?;
+            let mut m_mol = parse_structure_auto("mobile", &m_raw).map_err(|e| e.to_string())?;
+            let t_mol = parse_structure_auto("target", &t_raw).map_err(|e| e.to_string())?;
+            let tf = cealign_superpose(&mut m_mol, mobile_chain, &t_mol, target_chain)
+                .map_err(|e| e.to_string())?;
+            if let Some(p) = out_pdb {
+                write_text(&p, &write_pdb(&m_mol))?;
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&tf).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!(
+                    "CEAlign (sequence-independent) {mobile_chain} -> {target_chain}: RMSD = {:.4} Å ({} core guide atoms).",
+                    tf.rmsd_a, tf.aligned_pairs
+                );
+            }
+        }
+        Commands::Morph {
+            from,
+            to,
+            frames,
+            out_pdb,
+            out_movie,
+            width,
+            height,
+            fps,
+        } => {
+            let raw_a = std::fs::read_to_string(&from).map_err(|e| e.to_string())?;
+            let raw_b = std::fs::read_to_string(&to).map_err(|e| e.to_string())?;
+            let mol_a = parse_structure_auto("from", &raw_a).map_err(|e| e.to_string())?;
+            let mol_b = parse_structure_auto("to", &raw_b).map_err(|e| e.to_string())?;
+            let morphed = morph_biomolecules(&mol_a, &mol_b, frames).map_err(|e| e.to_string())?;
+            if let Some(p) = out_pdb {
+                write_text(&p, &write_multi_model_pdb(&morphed))?;
+                println!(
+                    "Wrote {}-frame conformational morph PDB -> {}",
+                    morphed.frames.len(),
+                    p.display()
+                );
+            }
+            if let Some(mp) = out_movie {
+                let mut sess = BiomolSession::default();
+                sess.load_structure_file(&from).map_err(|e| e.to_string())?;
+                sess.add_structure_file(&to).map_err(|e| e.to_string())?;
+                let _ = sess
+                    .execute_dsl(&format!("morph #1 #2 {frames}"))
+                    .map_err(|e| e.to_string())?;
+                let msg = sess
+                    .execute_dsl(&format!(
+                        "movie morph {} {frames} {width} {height} {fps}",
+                        mp.display()
+                    ))
+                    .map_err(|e| e.to_string())?;
+                println!("{msg}");
+            } else {
+                println!(
+                    "Generated {} SHAKE-relaxed conformational morph frames ({} atoms).",
+                    morphed.frames.len(),
+                    morphed.atoms.len()
+                );
+            }
+        }
+        Commands::Pae {
+            pdb,
+            pae_json,
+            json,
+        } => {
+            let raw = std::fs::read_to_string(&pdb).map_err(|e| e.to_string())?;
+            let id = pdb.file_stem().and_then(|s| s.to_str()).unwrap_or("mol");
+            let mol = parse_structure_auto(id, &raw).map_err(|e| e.to_string())?;
+            let pae = if let Some(jp) = pae_json {
+                let jtxt = std::fs::read_to_string(&jp).map_err(|e| e.to_string())?;
+                parse_pae_json(&jp.display().to_string(), &jtxt).map_err(|e| e.to_string())?
+            } else {
+                estimate_pae_proxy_from_structure(&mol)
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "label": pae.label,
+                        "length": pae.length,
+                        "mean_pae": pae.mean_pae,
+                        "max_pae": pae.max_pae,
+                        "is_experimental_json": pae.is_experimental_json,
+                        "domain_blocks": pae.domain_blocks,
+                    }))
+                    .map_err(|e| e.to_string())?
+                );
+            } else {
+                println!(
+                    "PAE '{}': {}x{}, mean={:.2} Å, max={:.2} Å, experimental_json={}, rigid domains={:?}",
+                    pae.label,
+                    pae.length,
+                    pae.length,
+                    pae.mean_pae,
+                    pae.max_pae,
+                    pae.is_experimental_json,
+                    pae.domain_blocks
+                );
+            }
+        }
+        Commands::Movie {
+            pdb,
+            mode,
+            to_pdb,
+            style,
+            color,
+            preset,
+            key,
+            scalebar,
+            frames,
+            width,
+            height,
+            fps,
+            out,
+        } => {
+            let mut sess = BiomolSession::default();
+            sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+            if let Some(tp) = to_pdb {
+                sess.add_structure_file(&tp).map_err(|e| e.to_string())?;
+                if mode.eq_ignore_ascii_case("morph") {
+                    let _ = sess
+                        .execute_dsl(&format!("morph #1 #2 {frames}"))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            let _ = sess
+                .execute_dsl(&format!("style {style}; color {color}"))
+                .map_err(|e| e.to_string())?;
+            if let Some(p) = preset {
+                let _ = sess
+                    .execute_dsl(&format!("preset {p}"))
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(k) = key {
+                let _ = sess
+                    .execute_dsl(&format!("key {k}"))
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(sb) = scalebar {
+                let _ = sess
+                    .execute_dsl(&format!("scalebar {sb:.1}"))
+                    .map_err(|e| e.to_string())?;
+            }
+            let msg = sess
+                .execute_dsl(&format!(
+                    "movie {mode} {} {frames} {width} {height} {fps}",
+                    out.display()
+                ))
+                .map_err(|e| e.to_string())?;
+            println!("{msg}");
         }
     }
     Ok(())

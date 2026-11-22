@@ -21,17 +21,24 @@ use biomol_physics::run_local_langevin_md;
 use biomol_rna::{analyze_ncrna_mrna, find_rna_preset, render_rna_markdown};
 use craftbio_report::{export_artcraft_bundle, write_biomol_html_dossier};
 use craftbio_scene::{
-    ColorScheme, CraftSceneDocument, DockCraftSceneBundle, GridBox3D, LightingPreset,
-    ProvenanceEntry, ProvenanceKind, RepresentationKind, SelectionBoxSnapshot,
+    ColorKeyLegend, ColorScheme, CraftSceneDocument, DockCraftSceneBundle, GridBox3D, Label2D,
+    Label3D, LightingPreset, LineOverlay, ProvenanceEntry, ProvenanceKind, RepresentationKind,
+    ScaleBarSpec, SelectionBoxSnapshot, SphereOverlay,
 };
 use craftbio_struct::{
-    Biomolecule, ResidueClass, VolumeGrid3D, evaluate_selection, load_dcd_frames, matchmaker_align,
-    parse_dx_map, parse_mrc_map, parse_sdf_poses, parse_structure_auto, write_mmcif,
+    Biomolecule, GeometryAxis, GeometryPlane, MsaAlignment, PaeMatrix, ResidueClass, VolumeGrid3D,
+    axis_angle_deg, build_synchronized_msa, cealign_superpose, compute_best_fit_plane,
+    compute_geometry_axis, detect_clashes, detect_contacts, detect_hbonds,
+    estimate_pae_proxy_from_structure, evaluate_selection, load_dcd_frames, matchmaker_align,
+    measure_angle_deg, measure_dihedral_deg, measure_distance, morph_biomolecules, parse_dx_map,
+    parse_mrc_map, parse_pae_json, parse_sdf_poses, parse_structure_auto, write_mmcif,
     write_multi_model_pdb, write_pdb,
 };
 use craftbio_viewport::{
     Camera3D, CapsuleInstance, RenderOptions, RenderSceneData, SphereInstance, build_render_scene,
-    extract_isosurface_mesh, push_grid_box_wireframe, render_scene_png_bytes, write_scene_png,
+    extract_isosurface_mesh, push_grid_box_wireframe, render_fly_frames, render_rock_frames,
+    render_scene_png_bytes, render_scene_rgba, render_turntable_frames, write_movie_file,
+    write_scene_png,
 };
 pub use fetch::{FetchedAsset, fetch_structure_spec};
 use serde::{Deserialize, Serialize};
@@ -138,6 +145,15 @@ pub struct BiomolSession {
     pub provenance: Vec<ProvenanceEntry>,
     pub command_history: Vec<String>,
     pub last_module_markdown: String,
+    pub measurements_log: Vec<String>,
+    pub axes: Vec<GeometryAxis>,
+    pub planes: Vec<GeometryPlane>,
+    pub msa: Option<MsaAlignment>,
+    pub pae: Option<PaeMatrix>,
+    pub labels_3d: Vec<Label3D>,
+    pub labels_2d: Vec<Label2D>,
+    pub color_key: Option<ColorKeyLegend>,
+    pub scale_bar: Option<ScaleBarSpec>,
     pub dirty_geometry: bool,
 }
 
@@ -158,6 +174,15 @@ impl Default for BiomolSession {
             provenance: Vec::new(),
             command_history: Vec::new(),
             last_module_markdown: String::new(),
+            measurements_log: Vec::new(),
+            axes: Vec::new(),
+            planes: Vec::new(),
+            msa: None,
+            pae: None,
+            labels_3d: Vec::new(),
+            labels_2d: Vec::new(),
+            color_key: None,
+            scale_bar: None,
             dirty_geometry: true,
         }
     }
@@ -741,7 +766,385 @@ impl BiomolSession {
             }
         }
 
+        // Geometric PCA Axes (`define axis`) & Best-Fit Planes (`define plane`)
+        for ax in &self.axes {
+            let sa = [ax.start[0] as f32, ax.start[1] as f32, ax.start[2] as f32];
+            let sb = [ax.end[0] as f32, ax.end[1] as f32, ax.end[2] as f32];
+            scene.capsules.push(CapsuleInstance {
+                a: sa,
+                radius: 0.34,
+                b: sb,
+                dashed: 0.0,
+                color: [0.98, 0.78, 0.16, 1.0],
+            });
+            scene.spheres.push(SphereInstance {
+                center: sa,
+                radius: 0.48,
+                color: [0.98, 0.78, 0.16, 1.0],
+            });
+            scene.spheres.push(SphereInstance {
+                center: sb,
+                radius: 0.48,
+                color: [0.98, 0.78, 0.16, 1.0],
+            });
+        }
+        for pl in &self.planes {
+            let c = [
+                pl.centroid[0] as f32,
+                pl.centroid[1] as f32,
+                pl.centroid[2] as f32,
+            ];
+            let n = [
+                pl.normal[0] as f32,
+                pl.normal[1] as f32,
+                pl.normal[2] as f32,
+            ];
+            // Normal arrow + 12-segment perimeter ring representing best-fit plane disc
+            let tip = [c[0] + n[0] * 4.5, c[1] + n[1] * 4.5, c[2] + n[2] * 4.5];
+            scene.capsules.push(CapsuleInstance {
+                a: c,
+                radius: 0.16,
+                b: tip,
+                dashed: 0.0,
+                color: [0.22, 0.88, 0.96, 0.95],
+            });
+            let alt = if n[1].abs() < 0.8 {
+                [0.0_f32, 1.0, 0.0]
+            } else {
+                [1.0_f32, 0.0, 0.0]
+            };
+            let u = craftbio_viewport::normalize3(craftbio_viewport::cross3(n, alt));
+            let v = craftbio_viewport::normalize3(craftbio_viewport::cross3(n, u));
+            let rad = (pl.radius_a as f32).clamp(2.0, 24.0);
+            let segs = 16usize;
+            for s in 0..segs {
+                let a0 = (s as f32) * std::f32::consts::TAU / (segs as f32);
+                let a1 = ((s + 1) as f32) * std::f32::consts::TAU / (segs as f32);
+                let p0 = [
+                    c[0] + (u[0] * a0.cos() + v[0] * a0.sin()) * rad,
+                    c[1] + (u[1] * a0.cos() + v[1] * a0.sin()) * rad,
+                    c[2] + (u[2] * a0.cos() + v[2] * a0.sin()) * rad,
+                ];
+                let p1 = [
+                    c[0] + (u[0] * a1.cos() + v[0] * a1.sin()) * rad,
+                    c[1] + (u[1] * a1.cos() + v[1] * a1.sin()) * rad,
+                    c[2] + (u[2] * a1.cos() + v[2] * a1.sin()) * rad,
+                ];
+                scene.capsules.push(CapsuleInstance {
+                    a: p0,
+                    radius: 0.18,
+                    b: p1,
+                    dashed: 0.0,
+                    color: [0.22, 0.88, 0.96, 0.90],
+                });
+            }
+        }
+
+        // Propagate 3D/2D labels, publication Color Key legend, and calibrated Scale Bar
+        scene.labels_3d = self.labels_3d.clone();
+        scene.labels_2d = self.labels_2d.clone();
+        scene.color_key = self.color_key.clone();
+        scene.scale_bar = self.scale_bar.clone();
+
         scene
+    }
+
+    /// Build a standard publication `ColorKeyLegend` matching `kind` (`esp|mlp|sap|plddt|auto`).
+    #[must_use]
+    pub fn build_color_key(&self, kind: &str) -> ColorKeyLegend {
+        let mode = if kind.is_empty()
+            || kind.eq_ignore_ascii_case("auto")
+            || kind.eq_ignore_ascii_case("on")
+        {
+            match self.render_opts.color_scheme {
+                ColorScheme::ElectrostaticEsp => "esp",
+                ColorScheme::LipophilicityMlp => "mlp",
+                ColorScheme::Sap3D => "sap",
+                _ => "plddt",
+            }
+        } else {
+            kind
+        };
+        match mode.to_ascii_lowercase().as_str() {
+            "esp" | "electrostatic" => ColorKeyLegend {
+                title: "Electrostatic Potential (kT/e)".to_string(),
+                min_label: "-5.0".to_string(),
+                max_label: "+5.0".to_string(),
+                stops: vec![[0.92, 0.18, 0.18], [0.96, 0.96, 0.96], [0.16, 0.44, 0.95]],
+            },
+            "mlp" | "lipophilicity" => ColorKeyLegend {
+                title: "Lipophilicity MLP".to_string(),
+                min_label: "Hydrophilic".to_string(),
+                max_label: "Lipophilic".to_string(),
+                stops: vec![[0.04, 0.56, 0.58], [0.96, 0.96, 0.96], [0.72, 0.53, 0.06]],
+            },
+            "sap" => ColorKeyLegend {
+                title: "3D SAP Hydrophobicity".to_string(),
+                min_label: "-0.8".to_string(),
+                max_label: "+0.8".to_string(),
+                stops: vec![[0.42, 0.65, 0.95], [0.94, 0.94, 0.94], [0.94, 0.22, 0.15]],
+            },
+            _ => ColorKeyLegend {
+                title: "pLDDT / B-Factor".to_string(),
+                min_label: "50 (Low)".to_string(),
+                max_label: "100 (High)".to_string(),
+                stops: vec![
+                    [0.98, 0.48, 0.25],
+                    [0.99, 0.84, 0.22],
+                    [0.39, 0.79, 0.96],
+                    [0.05, 0.35, 0.86],
+                ],
+            },
+        }
+    }
+
+    fn resolve_atom_spec(&self, spec: &str) -> Result<(usize, String, [f64; 3]), ScriptError> {
+        let mol = self
+            .active_molecule()
+            .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+        let parts: Vec<&str> = spec.trim().split(':').collect();
+        if parts.len() < 2 {
+            return Err(ScriptError::Command(format!(
+                "expected CHAIN:RES[:ATOM] (e.g. A:10:CA), got '{spec}'"
+            )));
+        }
+        let ch = parts[0]
+            .chars()
+            .next()
+            .ok_or_else(|| ScriptError::Command("missing chain id".to_string()))?;
+        let rseq: i32 = parts[1]
+            .parse()
+            .map_err(|_| ScriptError::Command(format!("bad residue number in '{spec}'")))?;
+        let atom_name = parts.get(2).copied();
+        let idx = if let Some(an) = atom_name {
+            mol.atoms
+                .iter()
+                .position(|a| a.chain == ch && a.res_seq == rseq && a.name.eq_ignore_ascii_case(an))
+        } else {
+            mol.chain(ch)
+                .and_then(|c| c.residues.iter().find(|r| r.res_seq == rseq))
+                .and_then(|r| r.guide_idx.or_else(|| r.atom_indices.first().copied()))
+        }
+        .ok_or_else(|| ScriptError::Command(format!("atom '{spec}' not found in active model")))?;
+        let a = &mol.atoms[idx];
+        Ok((
+            idx,
+            format!("{}:{}{}.{}", a.chain, a.res_name, a.res_seq, a.name),
+            a.coords,
+        ))
+    }
+
+    /// Record an interactive 2-atom Euclidean distance measurement with dashed line & 3D label.
+    pub fn add_distance_measurement(&mut self, a: usize, b: usize) -> Result<String, ScriptError> {
+        let (pa, pb, d, msg) = {
+            let mol = self
+                .active_molecule()
+                .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+            let (Some(aa), Some(ab)) = (mol.atoms.get(a), mol.atoms.get(b)) else {
+                return Err(ScriptError::Command("atom index out of range".to_string()));
+            };
+            let d = measure_distance(aa.coords, ab.coords);
+            let la = format!("{}:{}{}.{}", aa.chain, aa.res_name, aa.res_seq, aa.name);
+            let lb = format!("{}:{}{}.{}", ab.chain, ab.res_name, ab.res_seq, ab.name);
+            (
+                aa.coords,
+                ab.coords,
+                d,
+                format!("Dist({la} — {lb}) = {d:.2} Å"),
+            )
+        };
+        let mid = [
+            0.5 * (pa[0] + pb[0]),
+            0.5 * (pa[1] + pb[1]),
+            0.5 * (pa[2] + pb[2]),
+        ];
+        self.render_opts.line_overlays.push(LineOverlay {
+            label: msg.clone(),
+            from: pa,
+            to: pb,
+            dashed: true,
+            rgba: [0.99, 0.90, 0.22, 1.0],
+        });
+        self.labels_3d.push(Label3D {
+            text: format!("{d:.2} A"),
+            coords: mid,
+            rgba: [0.99, 0.94, 0.35, 1.0],
+            font_scale: 1.0,
+        });
+        self.measurements_log.push(msg.clone());
+        self.sync_active_render_opts();
+        self.dirty_geometry = true;
+        Ok(msg)
+    }
+
+    /// Record an interactive 3-atom geometric angle measurement (`a - b - c`) with lines & 3D label.
+    pub fn add_angle_measurement(
+        &mut self,
+        a: usize,
+        b: usize,
+        c: usize,
+    ) -> Result<String, ScriptError> {
+        let (pa, pb, pc, ang, msg) = {
+            let mol = self
+                .active_molecule()
+                .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+            let (Some(aa), Some(ab), Some(ac)) =
+                (mol.atoms.get(a), mol.atoms.get(b), mol.atoms.get(c))
+            else {
+                return Err(ScriptError::Command("atom index out of range".to_string()));
+            };
+            let ang = measure_angle_deg(aa.coords, ab.coords, ac.coords);
+            let msg = format!(
+                "Angle({}:{}.{} - {}:{}.{} - {}:{}.{}) = {ang:.1}°",
+                aa.chain,
+                aa.res_seq,
+                aa.name,
+                ab.chain,
+                ab.res_seq,
+                ab.name,
+                ac.chain,
+                ac.res_seq,
+                ac.name
+            );
+            (aa.coords, ab.coords, ac.coords, ang, msg)
+        };
+        self.render_opts.line_overlays.push(LineOverlay {
+            label: msg.clone(),
+            from: pa,
+            to: pb,
+            dashed: true,
+            rgba: [0.35, 0.92, 0.98, 1.0],
+        });
+        self.render_opts.line_overlays.push(LineOverlay {
+            label: msg.clone(),
+            from: pb,
+            to: pc,
+            dashed: true,
+            rgba: [0.35, 0.92, 0.98, 1.0],
+        });
+        self.labels_3d.push(Label3D {
+            text: format!("{ang:.1}°"),
+            coords: pb,
+            rgba: [0.45, 0.96, 1.0, 1.0],
+            font_scale: 1.0,
+        });
+        self.measurements_log.push(msg.clone());
+        self.sync_active_render_opts();
+        self.dirty_geometry = true;
+        Ok(msg)
+    }
+
+    /// Record an interactive 4-atom signed dihedral/torsion angle measurement (`a-b-c-d`).
+    pub fn add_dihedral_measurement(
+        &mut self,
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+    ) -> Result<String, ScriptError> {
+        let (pa, pb, pc, pd, tor, msg) = {
+            let mol = self
+                .active_molecule()
+                .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+            let (Some(aa), Some(ab), Some(ac), Some(ad)) = (
+                mol.atoms.get(a),
+                mol.atoms.get(b),
+                mol.atoms.get(c),
+                mol.atoms.get(d),
+            ) else {
+                return Err(ScriptError::Command("atom index out of range".to_string()));
+            };
+            let tor = measure_dihedral_deg(aa.coords, ab.coords, ac.coords, ad.coords);
+            let msg = format!(
+                "Dihedral({}:{}.{} - {}:{}.{} - {}:{}.{} - {}:{}.{}) = {tor:.1}°",
+                aa.chain,
+                aa.res_seq,
+                aa.name,
+                ab.chain,
+                ab.res_seq,
+                ab.name,
+                ac.chain,
+                ac.res_seq,
+                ac.name,
+                ad.chain,
+                ad.res_seq,
+                ad.name
+            );
+            (aa.coords, ab.coords, ac.coords, ad.coords, tor, msg)
+        };
+        let mid = [
+            0.5 * (pb[0] + pc[0]),
+            0.5 * (pb[1] + pc[1]),
+            0.5 * (pb[2] + pc[2]),
+        ];
+        for &(p, q) in &[(pa, pb), (pb, pc), (pc, pd)] {
+            self.render_opts.line_overlays.push(LineOverlay {
+                label: msg.clone(),
+                from: p,
+                to: q,
+                dashed: true,
+                rgba: [0.88, 0.52, 0.99, 1.0],
+            });
+        }
+        self.labels_3d.push(Label3D {
+            text: format!("phi {tor:.1}°"),
+            coords: mid,
+            rgba: [0.94, 0.68, 1.0, 1.0],
+            font_scale: 1.0,
+        });
+        self.measurements_log.push(msg.clone());
+        self.sync_active_render_opts();
+        self.dirty_geometry = true;
+        Ok(msg)
+    }
+
+    /// Highlight and select a PAE residue range `[start_idx..=end_idx]` in the active 3D model.
+    pub fn select_pae_domain(&mut self, start_idx: usize, end_idx: usize) -> String {
+        let (lo, hi, domain_res, mask) = {
+            let Some(mol) = self.active_molecule() else {
+                return "No active model.".to_string();
+            };
+            let mut polymer_res: Vec<(char, i32)> = Vec::new();
+            for ch in &mol.chains {
+                for r in &ch.residues {
+                    if matches!(
+                        r.class,
+                        ResidueClass::Protein | ResidueClass::Rna | ResidueClass::Dna
+                    ) && r.guide_idx.is_some()
+                    {
+                        polymer_res.push((r.chain, r.res_seq));
+                    }
+                }
+            }
+            let lo = start_idx.min(end_idx);
+            let hi = start_idx
+                .max(end_idx)
+                .min(polymer_res.len().saturating_sub(1));
+            let slice: Vec<(char, i32)> =
+                polymer_res.iter().take(hi + 1).skip(lo).copied().collect();
+            let domain_set: std::collections::HashSet<(char, i32)> =
+                slice.iter().copied().collect();
+            let mask: Vec<bool> = mol
+                .atoms
+                .iter()
+                .map(|a| domain_set.contains(&(a.chain, a.res_seq)))
+                .collect();
+            (lo, hi, slice, mask)
+        };
+        for (ch, rs) in domain_res {
+            self.render_opts
+                .residue_highlights
+                .insert((ch, rs), [0.16, 0.88, 0.56]);
+        }
+        let cnt = mask.iter().filter(|&&b| b).count();
+        self.render_opts.selected_atoms = mask;
+        self.sync_active_render_opts();
+        self.dirty_geometry = true;
+        format!(
+            "Highlighted PAE domain residues {}..={} ({cnt} atoms).",
+            lo + 1,
+            hi + 1
+        )
     }
 
     /// Save the current multi-model camera/style/clip/ViewDock state into a named or `f1..f12` scene.
@@ -1129,6 +1532,7 @@ impl BiomolSession {
                 }
                 let r = match rest.to_ascii_lowercase().as_str() {
                     "cartoon" | "ribbon" => RepresentationKind::Cartoon,
+                    "putty" | "sausage" | "worm" => RepresentationKind::Putty,
                     "nucleic" | "rna" | "ladder" => RepresentationKind::NucleicLadder,
                     "sticks" | "stick" => RepresentationKind::Sticks,
                     "spheres" | "sphere" | "vdw" => RepresentationKind::Spheres,
@@ -1136,7 +1540,7 @@ impl BiomolSession {
                     "lines" | "line" => RepresentationKind::Lines,
                     other => {
                         return Err(ScriptError::Command(format!(
-                            "unknown style '{other}' (use cartoon|nucleic|sticks|spheres|surface|lines)"
+                            "unknown style '{other}' (use cartoon|putty|nucleic|sticks|spheres|surface|lines)"
                         )));
                     }
                 };
@@ -1868,6 +2272,619 @@ impl BiomolSession {
                     sum.out_dir
                 ))
             }
+            "putty" => {
+                let on = !matches!(rest.to_ascii_lowercase().as_str(), "off" | "false" | "0");
+                self.render_opts.representation = if on {
+                    RepresentationKind::Putty
+                } else {
+                    RepresentationKind::Cartoon
+                };
+                if on {
+                    self.render_opts.color_scheme = ColorScheme::BfactorPlddt;
+                }
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                Ok(format!("B-Factor / Attribute Putty mode: {on}."))
+            }
+            "hbonds" => {
+                let max_d: f64 = rest.parse().unwrap_or(3.5);
+                let mol = self
+                    .active_molecule()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?
+                    .clone();
+                let hbs = detect_hbonds(&mol, None, None, max_d, 95.0);
+                for h in hbs.iter().take(250) {
+                    self.render_opts.line_overlays.push(LineOverlay {
+                        label: format!("HBond {} - {} ({:.2} A)", h.label_a, h.label_b, h.distance_a),
+                        from: h.coords_a,
+                        to: h.coords_b,
+                        dashed: true,
+                        rgba: [0.24, 0.85, 0.99, 0.95],
+                    });
+                }
+                let mut md = format!(
+                    "## Hydrogen Bonds (`hbonds`, cutoff {max_d:.1} Å)\n\nDetected **{}** geometric H-bonds.\n\n| Donor/Acceptor A | Donor/Acceptor B | Dist (Å) | Angle (°) | Est. E (kcal/mol) |\n|---|---|---:|---:|---:|\n",
+                    hbs.len()
+                );
+                for h in hbs.iter().take(30) {
+                    md.push_str(&format!(
+                        "| `{}` | `{}` | {:.2} | {:.1} | {:.2} |\n",
+                        h.label_a, h.label_b, h.distance_a, h.angle_deg, h.energy_kcal
+                    ));
+                }
+                self.last_module_markdown = md;
+                let msg = format!("Detected {} hydrogen bonds (<= {max_d:.1} Å).", hbs.len());
+                self.measurements_log.push(msg.clone());
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                Ok(msg)
+            }
+            "clashes" => {
+                let ov: f64 = rest.parse().unwrap_or(0.60);
+                let mol = self
+                    .active_molecule()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?
+                    .clone();
+                let clashes = detect_clashes(&mol, None, None, ov);
+                for c in clashes.iter().take(120) {
+                    let mid = [
+                        0.5 * (c.coords_a[0] + c.coords_b[0]),
+                        0.5 * (c.coords_a[1] + c.coords_b[1]),
+                        0.5 * (c.coords_a[2] + c.coords_b[2]),
+                    ];
+                    self.render_opts.sphere_overlays.push(SphereOverlay {
+                        label: format!("Clash {} - {} ({:.2} A ov)", c.label_a, c.label_b, c.overlap_a),
+                        category: "clash".to_string(),
+                        coords: mid,
+                        radius_a: (0.45 + 0.35 * c.overlap_a).clamp(0.45, 1.3),
+                        rgba: [0.96, 0.18, 0.24, 0.72],
+                    });
+                    self.render_opts.line_overlays.push(LineOverlay {
+                        label: format!("Clash {:.2} A", c.overlap_a),
+                        from: c.coords_a,
+                        to: c.coords_b,
+                        dashed: true,
+                        rgba: [0.98, 0.22, 0.28, 1.0],
+                    });
+                }
+                let mut md = format!(
+                    "## Steric Clashes (`clashes`, VDW overlap >= {ov:.2} Å)\n\nDetected **{}** steric clashes.\n\n| Atom A | Atom B | Dist (Å) | VDW Overlap (Å) |\n|---|---|---:|---:|\n",
+                    clashes.len()
+                );
+                for c in clashes.iter().take(30) {
+                    md.push_str(&format!(
+                        "| `{}` | `{}` | {:.2} | {:.2} |\n",
+                        c.label_a, c.label_b, c.distance_a, c.overlap_a
+                    ));
+                }
+                self.last_module_markdown = md;
+                let msg = format!("Detected {} steric clashes (overlap >= {ov:.2} Å).", clashes.len());
+                self.measurements_log.push(msg.clone());
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                Ok(msg)
+            }
+            "contacts" => {
+                let cut: f64 = rest.parse().unwrap_or(4.0);
+                let mol = self
+                    .active_molecule()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?
+                    .clone();
+                let contacts = detect_contacts(&mol, None, None, cut, 200);
+                for c in contacts.iter().take(150) {
+                    self.render_opts.line_overlays.push(LineOverlay {
+                        label: format!("Contact {} - {} ({:.2} A)", c.label_a, c.label_b, c.distance_a),
+                        from: c.coords_a,
+                        to: c.coords_b,
+                        dashed: true,
+                        rgba: [0.98, 0.72, 0.22, 0.85],
+                    });
+                }
+                let mut md = format!(
+                    "## Atomic Contacts (`contacts`, cutoff {cut:.1} Å)\n\nDetected **{}** inter-chain contacts.\n\n| Atom A | Atom B | Dist (Å) |\n|---|---|---:|\n",
+                    contacts.len()
+                );
+                for c in contacts.iter().take(30) {
+                    md.push_str(&format!(
+                        "| `{}` | `{}` | {:.2} |\n",
+                        c.label_a, c.label_b, c.distance_a
+                    ));
+                }
+                self.last_module_markdown = md;
+                let msg = format!("Detected {} contacts (<= {cut:.1} Å).", contacts.len());
+                self.measurements_log.push(msg.clone());
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                Ok(msg)
+            }
+            "distance" | "dist" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                if toks.len() < 2 {
+                    return Err(ScriptError::Command(
+                        "usage: distance <CHAIN:RES[:ATOM]> <CHAIN:RES[:ATOM]>".to_string(),
+                    ));
+                }
+                let (ia, _, _) = self.resolve_atom_spec(toks[0])?;
+                let (ib, _, _) = self.resolve_atom_spec(toks[1])?;
+                self.add_distance_measurement(ia, ib)
+            }
+            "angle" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                if toks.len() < 3 {
+                    return Err(ScriptError::Command(
+                        "usage: angle <A1> <A2> <A3> (CHAIN:RES[:ATOM])".to_string(),
+                    ));
+                }
+                let (ia, _, _) = self.resolve_atom_spec(toks[0])?;
+                let (ib, _, _) = self.resolve_atom_spec(toks[1])?;
+                let (ic, _, _) = self.resolve_atom_spec(toks[2])?;
+                self.add_angle_measurement(ia, ib, ic)
+            }
+            "torsion" | "dihedral" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                if toks.len() < 4 {
+                    return Err(ScriptError::Command(
+                        "usage: torsion <A1> <A2> <A3> <A4> (CHAIN:RES[:ATOM])".to_string(),
+                    ));
+                }
+                let (ia, _, _) = self.resolve_atom_spec(toks[0])?;
+                let (ib, _, _) = self.resolve_atom_spec(toks[1])?;
+                let (ic, _, _) = self.resolve_atom_spec(toks[2])?;
+                let (id, _, _) = self.resolve_atom_spec(toks[3])?;
+                self.add_dihedral_measurement(ia, ib, ic, id)
+            }
+            "measure" => {
+                if rest.eq_ignore_ascii_case("clear") {
+                    self.measurements_log.clear();
+                    self.axes.clear();
+                    self.planes.clear();
+                    self.labels_3d.clear();
+                    self.render_opts.line_overlays.clear();
+                    self.render_opts.sphere_overlays.clear();
+                    self.sync_active_render_opts();
+                    self.dirty_geometry = true;
+                    return Ok("Cleared all measurements, axes, planes, and 3D labels.".to_string());
+                }
+                Ok(if self.measurements_log.is_empty() {
+                    "No measurements recorded yet.".to_string()
+                } else {
+                    self.measurements_log.join("\n")
+                })
+            }
+            "axis" => {
+                let mol = self
+                    .active_molecule()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let mut pts: Vec<[f64; 3]> = self
+                    .render_opts
+                    .selected_atoms
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &s)| s)
+                    .filter_map(|(i, _)| mol.atoms.get(i).map(|a| a.coords))
+                    .collect();
+                if pts.len() < 3 {
+                    pts = mol
+                        .chains
+                        .first()
+                        .map(|c| {
+                            c.residues
+                                .iter()
+                                .filter_map(|r| r.guide_idx.map(|gi| mol.atoms[gi].coords))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
+                let lbl = if rest.is_empty() {
+                    format!("axis_{}", self.axes.len() + 1)
+                } else {
+                    rest.to_string()
+                };
+                let ax = compute_geometry_axis(&lbl, &pts)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                let mut msg = format!(
+                    "Defined axis '{}' (len {:.2} Å, linearity {:.3}).",
+                    ax.label, ax.length_a, ax.linearity_ratio
+                );
+                if let Some(prev) = self.axes.last() {
+                    let ang = axis_angle_deg(prev.direction, ax.direction, true);
+                    msg.push_str(&format!(" Inter-axis angle vs '{}' = {ang:.1}°.", prev.label));
+                }
+                self.labels_3d.push(Label3D {
+                    text: ax.label.clone(),
+                    coords: ax.centroid,
+                    rgba: [0.99, 0.84, 0.28, 1.0],
+                    font_scale: 1.0,
+                });
+                self.axes.push(ax);
+                self.measurements_log.push(msg.clone());
+                self.dirty_geometry = true;
+                Ok(msg)
+            }
+            "plane" => {
+                let mol = self
+                    .active_molecule()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let mut pts: Vec<[f64; 3]> = self
+                    .render_opts
+                    .selected_atoms
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &s)| s)
+                    .filter_map(|(i, _)| mol.atoms.get(i).map(|a| a.coords))
+                    .collect();
+                if pts.len() < 3 {
+                    pts = mol
+                        .atoms
+                        .iter()
+                        .filter(|a| a.res_class == ResidueClass::Ligand)
+                        .map(|a| a.coords)
+                        .collect();
+                }
+                if pts.len() < 3 {
+                    pts = mol.atoms.iter().take(24).map(|a| a.coords).collect();
+                }
+                let lbl = if rest.is_empty() {
+                    format!("plane_{}", self.planes.len() + 1)
+                } else {
+                    rest.to_string()
+                };
+                let pl = compute_best_fit_plane(&lbl, &pts)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                let mut msg = format!(
+                    "Defined plane '{}' (r={:.2} Å, rms={:.3} Å).",
+                    pl.label, pl.radius_a, pl.rms_deviation_a
+                );
+                if let Some(prev) = self.planes.last() {
+                    let ang = axis_angle_deg(prev.normal, pl.normal, true);
+                    msg.push_str(&format!(" Inter-plane angle vs '{}' = {ang:.1}°.", prev.label));
+                }
+                self.labels_3d.push(Label3D {
+                    text: pl.label.clone(),
+                    coords: pl.centroid,
+                    rgba: [0.35, 0.92, 0.98, 1.0],
+                    font_scale: 1.0,
+                });
+                self.planes.push(pl);
+                self.measurements_log.push(msg.clone());
+                self.dirty_geometry = true;
+                Ok(msg)
+            }
+            "label" => {
+                if rest.eq_ignore_ascii_case("clear") {
+                    self.labels_3d.clear();
+                    self.labels_2d.clear();
+                    self.dirty_geometry = true;
+                    return Ok("Cleared all 3D & 2D labels.".to_string());
+                }
+                let mut parts = rest.splitn(2, char::is_whitespace);
+                let spec = parts.next().unwrap_or("");
+                let text = parts.next().unwrap_or("").trim();
+                let (_, auto_lbl, coords) = self.resolve_atom_spec(spec)?;
+                let lbl_text = if text.is_empty() {
+                    auto_lbl
+                } else {
+                    text.to_string()
+                };
+                self.labels_3d.push(Label3D {
+                    text: lbl_text.clone(),
+                    coords,
+                    rgba: [0.98, 0.96, 0.85, 1.0],
+                    font_scale: 1.0,
+                });
+                self.dirty_geometry = true;
+                Ok(format!("Added 3D label '{lbl_text}' at {spec}."))
+            }
+            "2dlabel" | "2dlabels" => {
+                if rest.eq_ignore_ascii_case("clear") {
+                    self.labels_2d.clear();
+                    self.dirty_geometry = true;
+                    return Ok("Cleared 2D labels.".to_string());
+                }
+                let toks: Vec<&str> = rest.splitn(3, char::is_whitespace).collect();
+                if toks.len() < 3 {
+                    return Err(ScriptError::Command(
+                        "usage: 2dlabel <x_0..1> <y_0..1> <text>".to_string(),
+                    ));
+                }
+                let x: f32 = toks[0].parse::<f32>().unwrap_or(0.04).clamp(0.02, 0.92);
+                let y: f32 = toks[1].parse::<f32>().unwrap_or(0.04).clamp(0.02, 0.92);
+                let text = toks[2].trim().to_string();
+                let id = format!("lbl2d_{}", self.labels_2d.len() + 1);
+                self.labels_2d.push(Label2D {
+                    id,
+                    text: text.clone(),
+                    norm_pos: [x, y],
+                    rgba: [0.96, 0.98, 1.0, 1.0],
+                    font_scale: 1.0,
+                });
+                self.dirty_geometry = true;
+                Ok(format!("Added 2D label '{text}' at ({x:.2}, {y:.2})."))
+            }
+            "key" => {
+                if matches!(rest.to_ascii_lowercase().as_str(), "off" | "false" | "none") {
+                    self.color_key = None;
+                    self.dirty_geometry = true;
+                    return Ok("Color Key legend hidden.".to_string());
+                }
+                let key = self.build_color_key(rest);
+                let t = key.title.clone();
+                self.color_key = Some(key);
+                self.dirty_geometry = true;
+                Ok(format!("Color Key legend enabled: {t}."))
+            }
+            "scalebar" => {
+                if matches!(rest.to_ascii_lowercase().as_str(), "off" | "false" | "none") {
+                    self.scale_bar = None;
+                    self.dirty_geometry = true;
+                    return Ok("Scale Bar hidden.".to_string());
+                }
+                let len_a: f32 = rest.parse::<f32>().unwrap_or(20.0).clamp(2.0, 200.0);
+                self.scale_bar = Some(ScaleBarSpec {
+                    length_a: len_a,
+                    label: format!("{len_a:.0} A"),
+                });
+                self.dirty_geometry = true;
+                Ok(format!("Calibrated Scale Bar enabled ({len_a:.0} Å)."))
+            }
+            "cealign" | "super" => {
+                let toks: Vec<&str> = rest
+                    .split([',', ' '])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if toks.len() < 2 {
+                    return Err(ScriptError::Command(
+                        "usage: cealign <#mob:C | mob_ch> <#ref:C | ref_ch>".to_string(),
+                    ));
+                }
+                if toks[0].starts_with('#') && toks[1].starts_with('#') {
+                    let parse_spec = |s: &str| -> Result<(u32, char), ScriptError> {
+                        let (m_s, c_s) = s.split_once(':').ok_or_else(|| {
+                            ScriptError::Command("expected #MODEL:CHAIN (e.g. #2:B)".to_string())
+                        })?;
+                        let mid = Self::parse_model_id_arg(m_s)
+                            .ok_or_else(|| ScriptError::Command("bad model id".to_string()))?;
+                        let ch = c_s
+                            .chars()
+                            .next()
+                            .ok_or_else(|| ScriptError::Command("bad chain id".to_string()))?;
+                        Ok((mid, ch))
+                    };
+                    let (m_id, mc) = parse_spec(toks[0])?;
+                    let (t_id, tc) = parse_spec(toks[1])?;
+                    let target_mol = self
+                        .models
+                        .iter()
+                        .find(|m| m.model_id == t_id)
+                        .map(|m| m.molecule.clone())
+                        .ok_or_else(|| ScriptError::Command(format!("model #{t_id} not found")))?;
+                    let mob = self
+                        .models
+                        .iter_mut()
+                        .find(|m| m.model_id == m_id)
+                        .ok_or_else(|| ScriptError::Command(format!("model #{m_id} not found")))?;
+                    let tf = cealign_superpose(&mut mob.molecule, mc, &target_mol, tc)
+                        .map_err(|e| ScriptError::Command(e.to_string()))?;
+                    self.focus_camera_all_visible();
+                    self.dirty_geometry = true;
+                    return Ok(format!(
+                        "CEAlign (seq-independent) #{m_id}:{mc} -> #{t_id}:{tc}: RMSD = {:.4} Å ({} core atoms).",
+                        tf.rmsd_a, tf.aligned_pairs
+                    ));
+                }
+                let mc = toks[0]
+                    .chars()
+                    .next()
+                    .ok_or_else(|| ScriptError::Command("bad mobile chain".to_string()))?;
+                let tc = toks[1]
+                    .chars()
+                    .next()
+                    .ok_or_else(|| ScriptError::Command("bad target chain".to_string()))?;
+                self.push_undo_snapshot();
+                let mol = self
+                    .active_molecule_mut()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let target_clone = mol.clone();
+                let tf = cealign_superpose(mol, mc, &target_clone, tc)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                self.dirty_geometry = true;
+                Ok(format!(
+                    "CEAlign chain {mc} -> {tc}: RMSD = {:.4} Å ({} core atoms).",
+                    tf.rmsd_a, tf.aligned_pairs
+                ))
+            }
+            "msa" => {
+                if self.models.is_empty() {
+                    return Err(ScriptError::Command("no biomolecule loaded".to_string()));
+                }
+                let refs: Vec<(&str, &Biomolecule)> = self
+                    .models
+                    .iter()
+                    .map(|m| (m.name.as_str(), &m.molecule))
+                    .collect();
+                let msa = build_synchronized_msa(&refs);
+                let mean_cons = if msa.column_conservation.is_empty() {
+                    0.0
+                } else {
+                    msa.column_conservation.iter().sum::<f32>()
+                        / (msa.column_conservation.len() as f32)
+                };
+                let mut md = format!(
+                    "## Synchronized Multi-Model MSA (`Match->Align`)\n\n- **Models:** `{}` | **Columns:** `{}` | **Mean Conservation:** `{:.1}%`\n\n```\n",
+                    msa.rows.len(),
+                    msa.num_columns,
+                    mean_cons * 100.0
+                );
+                for row in &msa.rows {
+                    let seq: String = row.aligned_chars.iter().take(80).collect();
+                    md.push_str(&format!("{:<14} [{}] {}\n", row.model_name, row.chain_id, seq));
+                }
+                md.push_str("```\n");
+                let msg = format!(
+                    "Built synchronized MSA: {} models x {} columns (mean conservation {:.1}%).",
+                    msa.rows.len(),
+                    msa.num_columns,
+                    mean_cons * 100.0
+                );
+                self.msa = Some(msa);
+                self.last_module_markdown = md;
+                Ok(msg)
+            }
+            "pae" => {
+                let pae = if rest.is_empty() || rest.eq_ignore_ascii_case("auto") {
+                    let mol = self
+                        .active_molecule()
+                        .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                    estimate_pae_proxy_from_structure(mol)
+                } else {
+                    let raw = std::fs::read_to_string(rest.trim_matches('"'))?;
+                    parse_pae_json(rest, &raw).map_err(|e| ScriptError::Command(e.to_string()))?
+                };
+                let msg = format!(
+                    "PAE matrix ready ('{}', {}x{}, mean {:.2} Å, max {:.2} Å, {} rigid domains, json={}).",
+                    pae.label,
+                    pae.length,
+                    pae.length,
+                    pae.mean_pae,
+                    pae.max_pae,
+                    pae.domain_blocks.len(),
+                    pae.is_experimental_json
+                );
+                self.last_module_markdown = format!(
+                    "## Predicted Aligned Error (PAE) Matrix\n\n- **Source:** `{}`\n- **Dimensions:** `{} x {}`\n- **Mean / Max PAE:** `{:.2} Å / {:.2} Å`\n- **Detected Rigid Domains:** `{:?}`\n",
+                    pae.label, pae.length, pae.length, pae.mean_pae, pae.max_pae, pae.domain_blocks
+                );
+                self.pae = Some(pae);
+                Ok(msg)
+            }
+            "morph" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                let (id_a, id_b, n_frames) = if toks.len() >= 2
+                    && toks[0].starts_with('#')
+                    && toks[1].starts_with('#')
+                {
+                    let a = Self::parse_model_id_arg(toks[0])
+                        .ok_or_else(|| ScriptError::Command("bad first model id".to_string()))?;
+                    let b = Self::parse_model_id_arg(toks[1])
+                        .ok_or_else(|| ScriptError::Command("bad second model id".to_string()))?;
+                    let f: usize = toks.get(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+                    (a, b, f)
+                } else if self.models.len() >= 2 {
+                    let f: usize = toks.first().and_then(|s| s.parse().ok()).unwrap_or(20);
+                    (self.models[0].model_id, self.models[1].model_id, f)
+                } else {
+                    return Err(ScriptError::Command(
+                        "usage: morph <#1> <#2> [frames] (load at least 2 conformations first)"
+                            .to_string(),
+                    ));
+                };
+                let mol_a = self
+                    .models
+                    .iter()
+                    .find(|m| m.model_id == id_a)
+                    .map(|m| m.molecule.clone())
+                    .ok_or_else(|| ScriptError::Command(format!("model #{id_a} not found")))?;
+                let mol_b = self
+                    .models
+                    .iter()
+                    .find(|m| m.model_id == id_b)
+                    .map(|m| m.molecule.clone())
+                    .ok_or_else(|| ScriptError::Command(format!("model #{id_b} not found")))?;
+                let morphed = morph_biomolecules(&mol_a, &mol_b, n_frames)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                let flen = morphed.frames.len();
+                // Hide original endpoints so the morphed trajectory plays cleanly in 3D
+                for m in &mut self.models {
+                    if m.model_id == id_a || m.model_id == id_b {
+                        m.visible = false;
+                    }
+                }
+                let loaded_msg = self.insert_model(morphed, None, "morph", false);
+                Ok(format!(
+                    "Morphed #{id_a} -> #{id_b} across {flen} SHAKE-relaxed frames. {loaded_msg}"
+                ))
+            }
+            "movie" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                if toks.len() < 2 {
+                    return Err(ScriptError::Command(
+                        "usage: movie <turn|rock|fly|morph> <out.gif|out.mp4|out.webm> [frames] [W] [H] [fps]"
+                            .to_string(),
+                    ));
+                }
+                let mode = toks[0].to_ascii_lowercase();
+                let out_path = Path::new(toks[1]);
+                let n_frames: usize = toks.get(2).and_then(|s| s.parse().ok()).unwrap_or(24);
+                let width: u32 = toks.get(3).and_then(|s| s.parse().ok()).unwrap_or(640);
+                let height: u32 = toks.get(4).and_then(|s| s.parse().ok()).unwrap_or(480);
+                let fps: u16 = toks.get(5).and_then(|s| s.parse().ok()).unwrap_or(12);
+
+                let frames_rgba = match mode.as_str() {
+                    "turn" | "turntable" => {
+                        let sc = self.build_viewport_scene();
+                        render_turntable_frames(&sc, &self.camera, width, height, n_frames)
+                            .map_err(|e| ScriptError::Command(e.to_string()))?
+                    }
+                    "rock" => {
+                        let sc = self.build_viewport_scene();
+                        render_rock_frames(&sc, &self.camera, width, height, n_frames, 30.0)
+                            .map_err(|e| ScriptError::Command(e.to_string()))?
+                    }
+                    "fly" => {
+                        let sc = self.build_viewport_scene();
+                        let mut kfs: Vec<Camera3D> =
+                            self.scenes.values().map(|s| s.camera.clone()).collect();
+                        if kfs.len() < 2 {
+                            let c0 = self.camera.clone();
+                            let mut c1 = c0.clone();
+                            c1.yaw += 1.25;
+                            c1.distance = (c1.distance * 0.78).max(8.0);
+                            kfs = vec![c0, c1];
+                        }
+                        let seg_f = (n_frames / (kfs.len() - 1).max(1)).max(4);
+                        render_fly_frames(&sc, &kfs, width, height, seg_f)
+                            .map_err(|e| ScriptError::Command(e.to_string()))?
+                    }
+                    "morph" | "trajectory" | "traj" => {
+                        let total = self.active_molecule().map_or(0, |m| m.frames.len());
+                        if total < 2 {
+                            return Err(ScriptError::Command(
+                                "active model has < 2 frames (run `morph`, `anm`, `md`, or `load_dcd` first)"
+                                    .to_string(),
+                            ));
+                        }
+                        let orig = self.active_molecule().map_or(0, |m| m.active_frame);
+                        let mut frames = Vec::with_capacity(total);
+                        for fi in 0..total {
+                            if let Some(mol) = self.active_molecule_mut() {
+                                mol.set_active_frame(fi);
+                            }
+                            let sc = self.build_viewport_scene();
+                            frames.push(
+                                render_scene_rgba(&sc, &self.camera, width, height, false)
+                                    .map_err(|e| ScriptError::Command(e.to_string()))?,
+                            );
+                        }
+                        if let Some(mol) = self.active_molecule_mut() {
+                            mol.set_active_frame(orig);
+                        }
+                        frames
+                    }
+                    other => {
+                        return Err(ScriptError::Command(format!(
+                            "unknown movie mode '{other}' (use turn|rock|fly|morph)"
+                        )));
+                    }
+                };
+                let frame_cnt = frames_rgba.len();
+                let bytes = write_movie_file(out_path, width, height, fps, &frames_rgba)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                Ok(format!(
+                    "Exported '{mode}' movie ({frame_cnt} frames @ {width}x{height}, {fps} fps) -> {} ({bytes} bytes).",
+                    out_path.display()
+                ))
+            }
             "undo" => {
                 if let Some(m) = self.active_model_mut()
                     && let Some(prev) = m.undo_stack.pop()
@@ -1991,6 +3008,92 @@ $$$$
         let sc = sess.build_viewport_scene();
         assert!(!sc.opaque_meshes.is_empty());
         assert!(!sc.capsules.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn wave5_measurements_cealign_msa_pae_morph_overlays_and_gif_movie()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut pdb1 = String::new();
+        let mut pdb2 = String::new();
+        let aas1 = [
+            "ALA", "VAL", "LEU", "ILE", "PHE", "TRP", "SER", "THR", "TYR", "ASN", "GLN", "ASP",
+        ];
+        let aas2 = [
+            "GLU", "LYS", "ARG", "HIS", "GLY", "PRO", "CYS", "MET", "ALA", "VAL", "LEU", "ILE",
+        ];
+        for i in 0..12usize {
+            let t = i as f64;
+            let x = t * 1.5;
+            let y = 2.3 * (t * 1.745).cos();
+            let z = 2.3 * (t * 1.745).sin();
+            pdb1.push_str(&format!(
+                "ATOM  {:5}  CA  {} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 {:5.2}           C\n",
+                i * 2 + 1,
+                aas1[i],
+                i + 1,
+                x,
+                y,
+                z,
+                92.0 - t * 3.0
+            ));
+            pdb1.push_str(&format!(
+                "ATOM  {:5}  O   {} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 {:5.2}           O\n",
+                i * 2 + 2,
+                aas1[i],
+                i + 1,
+                x,
+                y + 1.24,
+                z,
+                92.0 - t * 3.0
+            ));
+            let y2 = if i >= 6 { y + (i - 5) as f64 * 0.9 } else { y };
+            pdb2.push_str(&format!(
+                "ATOM  {:5}  CA  {} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 85.00           C\n",
+                i * 2 + 1,
+                aas2[i],
+                i + 1,
+                -y2 + 14.0,
+                x - 6.0,
+                z + 3.0
+            ));
+            pdb2.push_str(&format!(
+                "ATOM  {:5}  O   {} A{:4}    {:8.3}{:8.3}{:8.3}  1.00 85.00           O\n",
+                i * 2 + 2,
+                aas2[i],
+                i + 1,
+                -(y2 + 1.24) + 14.0,
+                x - 6.0,
+                z + 3.0
+            ));
+        }
+        let mut sess = BiomolSession::default();
+        sess.load_structure_text("conf_a", &pdb1, None)?;
+        sess.add_structure_text("conf_b", &pdb2, None)?;
+
+        let ce_out = sess.execute_dsl("cealign #2:A #1:A")?;
+        assert!(ce_out.contains("CEAlign"));
+
+        let _ = sess.execute_dsl(
+            "active #1; putty on; key plddt; scalebar 15; label A:1 N-Term; 2dlabel 0.04 0.04 Wave5; distance A:1:CA A:12:CA; angle A:1:CA A:6:CA A:12:CA; torsion A:1:CA A:4:CA A:8:CA A:12:CA; axis helix_ax; plane helix_pl; hbonds 3.5; clashes 0.6; msa; pae auto",
+        )?;
+        assert!(sess.color_key.is_some());
+        assert!(sess.scale_bar.is_some());
+        assert!(sess.msa.is_some());
+        assert!(sess.pae.is_some());
+        assert!(!sess.axes.is_empty() && !sess.planes.is_empty());
+
+        let m_out = sess.execute_dsl("morph #1 #2 8")?;
+        assert!(m_out.contains("Morphed #1 -> #2 across 8"));
+        assert_eq!(sess.active_molecule().map(|m| m.frames.len()), Some(8));
+
+        let gif_path =
+            std::env::temp_dir().join(format!("biomol_w5_morph_{}.gif", std::process::id()));
+        let mov = sess.execute_dsl(&format!("movie morph {} 8 160 120 10", gif_path.display()))?;
+        assert!(mov.contains("Exported 'morph' movie"));
+        let raw = std::fs::read(&gif_path)?;
+        assert_eq!(&raw[..6], b"GIF89a");
+        let _ = std::fs::remove_file(&gif_path);
         Ok(())
     }
 }

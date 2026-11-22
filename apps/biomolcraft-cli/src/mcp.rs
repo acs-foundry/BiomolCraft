@@ -231,6 +231,64 @@ impl Tools for BiomolTools {
                 ),
                 Effect::Edits,
             ),
+            tool(
+                "analyze_interactions",
+                "Chemical H-Bonds, Clashes, Contacts & Putty",
+                "Detect geometric hydrogen bonds, VDW steric clashes, and inter-chain contacts on the active structure, optionally enabling B-factor Putty, Color Key, and Scale Bar.",
+                object(
+                    json!({
+                        "max_dist_a": { "type": "number", "description": "H-bond cutoff in Angstroms (default 3.5)" },
+                        "clash_overlap_a": { "type": "number", "description": "Steric clash VDW overlap cutoff in Angstroms (default 0.60)" },
+                        "putty": { "type": "boolean", "description": "Switch active model to B-factor/pLDDT Putty mode" }
+                    }),
+                    &[],
+                ),
+                Effect::Edits,
+            ),
+            tool(
+                "cealign_models",
+                "Sequence-Independent 3D CEAlign",
+                "Load an optional second PDB/mmCIF from the sandbox and perform sequence-independent Combinatorial Extension 3D superposition (works at 0% sequence identity).",
+                object(
+                    json!({
+                        "mobile_path": string("Optional second PDB/mmCIF path inside sandbox read root to add as mobile model"),
+                        "mobile_chain": string("Mobile chain ID (default 'A')"),
+                        "target_chain": string("Target chain ID on #1 (default 'A')")
+                    }),
+                    &[],
+                ),
+                Effect::Edits,
+            ),
+            tool(
+                "morph_structures",
+                "Conformational Morph Trajectory",
+                "Generate a smooth SHAKE-relaxed conformational morph trajectory between active #1 and a second conformation PDB/mmCIF inside the sandbox read root.",
+                object(
+                    json!({
+                        "target_path": string("Second conformation PDB/mmCIF inside sandbox read root"),
+                        "frames": { "type": "integer", "description": "Number of morph frames (default 16, range 4..60)" }
+                    }),
+                    &["target_path"],
+                ),
+                Effect::Edits,
+            ),
+            tool(
+                "render_movie",
+                "Render Animated Biomolecular Movie (.gif / .mp4)",
+                "Render a smooth turntable, presentation rock, scene fly-through, or morph trajectory movie into the sandbox write root (pure-Rust GIF89a or H.264 MP4).",
+                object(
+                    json!({
+                        "mode": string("turn | rock | fly | morph"),
+                        "out_path": string("Output filename (.gif or .mp4) inside sandbox write root"),
+                        "frames": { "type": "integer", "description": "Frame count (default 16, max 60)" },
+                        "width": { "type": "integer", "description": "Width in px (default 480, max 1280)" },
+                        "height": { "type": "integer", "description": "Height in px (default 360, max 960)" },
+                        "fps": { "type": "integer", "description": "Frames per second (default 12)" }
+                    }),
+                    &["mode", "out_path"],
+                ),
+                Effect::Files,
+            ),
         ]
     }
 
@@ -537,6 +595,141 @@ impl Tools for BiomolTools {
                     Err(e) => text_result(e.to_string(), true),
                 }
             }
+            "analyze_interactions" => {
+                let max_d = args
+                    .get("max_dist_a")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(3.5);
+                let ov = args
+                    .get("clash_overlap_a")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.60);
+                let putty = args.get("putty").and_then(Value::as_bool).unwrap_or(false);
+                let mut cmd = format!("hbonds {max_d:.2}; clashes {ov:.2}; contacts 4.0");
+                if putty {
+                    cmd.push_str("; putty on; key plddt; scalebar 20");
+                }
+                match self.session.execute_dsl(&cmd) {
+                    Ok(msg) => text_result(
+                        format!("{msg}\n\n{}", self.session.last_module_markdown),
+                        false,
+                    ),
+                    Err(e) => text_result(e.to_string(), true),
+                }
+            }
+            "cealign_models" => {
+                let mc = args
+                    .get("mobile_chain")
+                    .and_then(Value::as_str)
+                    .unwrap_or("A");
+                let tc = args
+                    .get("target_chain")
+                    .and_then(Value::as_str)
+                    .unwrap_or("A");
+                if let Some(p) = args.get("mobile_path").and_then(Value::as_str)
+                    && !p.is_empty()
+                {
+                    match self.sandbox.read_string(Path::new(p)) {
+                        Ok(raw) => {
+                            let id = Path::new(p)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("mobile");
+                            if let Err(e) =
+                                self.session
+                                    .add_structure_text(id, &raw, Some(p.to_string()))
+                            {
+                                return text_result(e.to_string(), true);
+                            }
+                        }
+                        Err(e) => return text_result(format!("sandbox read rejected: {e}"), true),
+                    }
+                }
+                let cmd = if self.session.models.len() >= 2 {
+                    let mob_id = self.session.models.last().map_or(2, |m| m.model_id);
+                    let ref_id = self.session.models[0].model_id;
+                    format!("cealign #{mob_id}:{mc} #{ref_id}:{tc}")
+                } else {
+                    format!("cealign {mc} {tc}")
+                };
+                match self.session.execute_dsl(&cmd) {
+                    Ok(msg) => text_result(msg, false),
+                    Err(e) => text_result(e.to_string(), true),
+                }
+            }
+            "morph_structures" => {
+                let p = args
+                    .get("target_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let frames = args
+                    .get("frames")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(16)
+                    .clamp(4, 60);
+                match self.sandbox.read_string(Path::new(p)) {
+                    Ok(raw) => {
+                        let id = Path::new(p)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("target");
+                        if let Err(e) =
+                            self.session
+                                .add_structure_text(id, &raw, Some(p.to_string()))
+                        {
+                            return text_result(e.to_string(), true);
+                        }
+                        let a_id = self.session.models[0].model_id;
+                        let b_id = self.session.models.last().map_or(2, |m| m.model_id);
+                        match self
+                            .session
+                            .execute_dsl(&format!("morph #{a_id} #{b_id} {frames}"))
+                        {
+                            Ok(msg) => text_result(msg, false),
+                            Err(e) => text_result(e.to_string(), true),
+                        }
+                    }
+                    Err(e) => text_result(format!("sandbox read rejected: {e}"), true),
+                }
+            }
+            "render_movie" => {
+                let mode = args.get("mode").and_then(Value::as_str).unwrap_or("turn");
+                let out = args.get("out_path").and_then(Value::as_str).unwrap_or("");
+                let frames = args
+                    .get("frames")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(16)
+                    .clamp(4, 60);
+                let w = args
+                    .get("width")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(480)
+                    .clamp(64, 1280);
+                let h = args
+                    .get("height")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(360)
+                    .clamp(64, 960);
+                let fps = args
+                    .get("fps")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(12)
+                    .clamp(2, 30);
+                // Enforce sandbox write confinement via zero-byte preflight creation
+                match self.sandbox.write_bytes(Path::new(out), &[]) {
+                    Ok(safe_path) => {
+                        let cmd = format!(
+                            "movie {mode} {} {frames} {w} {h} {fps}",
+                            safe_path.display()
+                        );
+                        match self.session.execute_dsl(&cmd) {
+                            Ok(msg) => text_result(msg, false),
+                            Err(e) => text_result(e.to_string(), true),
+                        }
+                    }
+                    Err(e) => text_result(format!("sandbox write rejected: {e}"), true),
+                }
+            }
             other => text_result(format!("unknown tool '{other}'"), true),
         }
     }
@@ -601,7 +794,7 @@ mod tests {
             .pointer("/result/tools")
             .and_then(Value::as_array)
             .ok_or("no tools")?;
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 21);
 
         let rna = srv
             .handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fold_ncrna_mrna","arguments":{"preset":"guanine_riboswitch"}}}"#)
