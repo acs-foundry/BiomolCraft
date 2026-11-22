@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 
 //! `biomolcraft` — Flagship Pure-Rust `wgpu 24 + egui` Multi-Model Biomolecular 3D Studio,
-//! Interactive Modeling & Sculpting Workbench (`swapaa`/`swapna`/`bond_rot`/`tug`/`build`),
+//! Unified Typed Command Palette (`Ctrl+K` & `[TAB]` Autocomplete), Verified `.biomol.zip`
+//! Sessions, Live ArtCraft Suite Push, Interactive Modeling & Sculpting Workbench,
 //! Native **`ViewDockX`**, Crystallographic Symmetry, 3D SNFG Glycans, Cryo-EM `vop`/Orthoplanes,
-//! Chemical Measurements, MSA/PAE, Conformational Morphing & Movie Maker (`v0.6.0`).
+//! Chemical Measurements, MSA/PAE, Conformational Morphing & Movie Maker (`v1.0.0`).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -15,7 +16,7 @@ use biomol_modules::{
 };
 use biomol_physics::{OpenMmEnvStatus, check_openmm_biomol_env};
 use biomol_rna::{NcRnaAnalysisReport, analyze_ncrna_mrna, find_rna_preset, rna_presets};
-use biomol_script::{BiomolSession, PoseStatusTag};
+use biomol_script::{BiomolSession, PoseStatusTag, autocomplete_dsl, filter_command_palette};
 use craftbio_scene::{
     ColorScheme, CraftBioLinkServer, DockCraftSceneBundle, GridBox3D, InboundLinkCommand,
     LightingPreset, RepresentationKind, discover_craft_instances,
@@ -149,6 +150,12 @@ pub struct BiomolCraftApp {
     build_seq: String,
     sym_cutoff_a: f64,
     vop_zone_rad: f64,
+
+    // Wave 7: Unified Command Palette (Ctrl+K), Console History, & Portable .biomol.zip Sessions
+    history_cursor: Option<usize>,
+    palette_open: bool,
+    palette_query: String,
+    session_zip_path: String,
 }
 
 impl Default for BiomolCraftApp {
@@ -178,7 +185,7 @@ impl BiomolCraftApp {
             fetch_id_input: "1CRN".to_string(),
             console_input: String::new(),
             console_log: vec![
-                "BiomolCraft v0.6.0 — wgpu Depth32F+SSAO · swapna/tug/build · Sym/SNFG · vop/Orthoplanes · ViewDockX. Type 'help'.".to_string(),
+                "BiomolCraft v1.0.0 — Unified Command Palette (Ctrl+K) · [TAB] Autocomplete · .biomol.zip Sessions · ArtCraft Live Push · ViewDockX. Type 'help'.".to_string(),
                 link_status.to_string(),
             ],
             picked_atom_info: "Click any atom/residue in 3D or sequence strip to inspect".to_string(),
@@ -208,7 +215,7 @@ impl BiomolCraftApp {
             adc_dar: 8.0,
             pick_mode: PickMode::Inspect,
             pick_buffer: Vec::new(),
-            label2d_input: "BiomolCraft v0.5.0".to_string(),
+            label2d_input: "BiomolCraft v1.0.0".to_string(),
             scalebar_len_a: 20.0,
             pae_json_input: String::new(),
             morph_frames: 20,
@@ -228,6 +235,10 @@ impl BiomolCraftApp {
             build_seq: "AKLTYWDSHEAA".to_string(),
             sym_cutoff_a: 5.0,
             vop_zone_rad: 5.0,
+            history_cursor: None,
+            palette_open: false,
+            palette_query: String::new(),
+            session_zip_path: "/tmp/biomolcraft_session.biomol.zip".to_string(),
         };
 
         if let Some(bundle_path) = startup.dock_bundle {
@@ -369,6 +380,14 @@ impl BiomolCraftApp {
                         }
                     }
                 }
+                InboundLinkCommand::ImportArtCraftBundle(payload) => {
+                    let msg = format!(
+                        "[Craft Link ← {}] ArtCraft bundle '{}' staged at {}",
+                        payload.source_app, payload.title, payload.bundle_dir
+                    );
+                    self.console_log.push(msg.clone());
+                    self.status_line = msg;
+                }
                 InboundLinkCommand::RunDsl {
                     command,
                     source_app,
@@ -460,6 +479,18 @@ impl BiomolCraftApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // Ctrl+K toggles the unified Command Palette anytime (even while editing text!)
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K)) {
+            self.palette_open = !self.palette_open;
+            if self.palette_open {
+                self.palette_query.clear();
+            }
+            return;
+        }
+        if self.palette_open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.palette_open = false;
+            return;
+        }
         if ctx.wants_keyboard_input() {
             return;
         }
@@ -596,6 +627,22 @@ impl eframe::App for BiomolCraftApp {
                         self.run_dsl("save /tmp/biomolcraft.craftscene.json");
                         ui.close_menu();
                     }
+                    ui.separator();
+                    if ui.button("Save Portable Session (.biomol.zip)").clicked() {
+                        let p = self.session_zip_path.clone();
+                        self.run_dsl(&format!("save_session {p}"));
+                        ui.close_menu();
+                    }
+                    if ui.button("Load Portable Session (.biomol.zip)").clicked() {
+                        let p = self.session_zip_path.clone();
+                        self.run_dsl(&format!("load_session {p}"));
+                        ui.close_menu();
+                    }
+                    if ui.button("Command Palette (Ctrl+K)").clicked() {
+                        self.palette_open = true;
+                        self.palette_query.clear();
+                        ui.close_menu();
+                    }
                 });
                 ui.menu_button("View", |ui| {
                     if ui.button("Preset: ChimeraX Soft (White + SSAO)").clicked() {
@@ -679,9 +726,17 @@ impl eframe::App for BiomolCraftApp {
                     }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("⌘ Ctrl+K Palette")
+                        .on_hover_text("Open Unified BiomolCraft Command Palette (Ctrl+K)")
+                        .clicked()
+                    {
+                        self.palette_open = !self.palette_open;
+                        self.palette_query.clear();
+                    }
                     ui.label(
                         egui::RichText::new(
-                            "BiomolCraft v0.6.0 · SSAO · swapna/tug · Sym/SNFG · vop · ViewDockX",
+                            "BiomolCraft v1.0.0 · SSAO · .biomol.zip · ArtCraft Push · ViewDockX",
                         )
                         .strong()
                         .color(egui::Color32::from_rgb(56, 189, 248)),
@@ -783,25 +838,170 @@ impl eframe::App for BiomolCraftApp {
                             ui.monospace(line);
                         }
                     });
+                let mut execute_now: Option<String> = None;
+                let suggestions = if self.console_input.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    autocomplete_dsl(&self.console_input)
+                };
                 ui.horizontal(|ui| {
                     ui.strong("DSL>");
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.console_input)
-                            .desired_width(ui.available_width() - 75.0)
+                            .desired_width((ui.available_width() - 125.0).max(160.0))
                             .hint_text(
-                                "e.g. fetch 1crn; preset pub_white; color mlp; surface on; scene save f1",
+                                "[TAB] autocomplete · ↑/↓ history · Ctrl+K palette · e.g. save_session /tmp/s.biomol.zip",
                             ),
                     );
+                    if resp.has_focus() {
+                        // [TAB] Autocomplete from unified COMMAND_REGISTRY
+                        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab))
+                            && let Some(first) = suggestions.first()
+                        {
+                            self.console_input = first.insert_text.clone();
+                        }
+                        // Up / Down arrow command history recall
+                        let hlen = self.session.command_history.len();
+                        if hlen > 0 {
+                            if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                                let next = match self.history_cursor {
+                                    None => hlen - 1,
+                                    Some(0) => 0,
+                                    Some(idx) => idx - 1,
+                                };
+                                self.history_cursor = Some(next);
+                                self.console_input = self.session.command_history[next].clone();
+                            } else if ui.input(|i| i.key_pressed(egui::Key::ArrowDown))
+                                && let Some(idx) = self.history_cursor
+                            {
+                                if idx + 1 < hlen {
+                                    self.history_cursor = Some(idx + 1);
+                                    self.console_input =
+                                        self.session.command_history[idx + 1].clone();
+                                } else {
+                                    self.history_cursor = None;
+                                    self.console_input.clear();
+                                }
+                            }
+                        }
+                    }
                     if (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                         || ui.button("Run").clicked()
                     {
                         let cmd = std::mem::take(&mut self.console_input);
+                        self.history_cursor = None;
                         if !cmd.trim().is_empty() {
-                            self.run_dsl(&cmd);
+                            execute_now = Some(cmd);
                         }
                     }
+                    if ui
+                        .small_button("Ctrl+K")
+                        .on_hover_text("Open Command Palette")
+                        .clicked()
+                    {
+                        self.palette_open = true;
+                        self.palette_query.clear();
+                    }
                 });
+                if !suggestions.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.small("[TAB]:");
+                        for item in suggestions.iter().take(5) {
+                            if ui
+                                .small_button(&item.display_label)
+                                .on_hover_text(item.description)
+                                .clicked()
+                            {
+                                self.console_input = item.insert_text.clone();
+                            }
+                        }
+                    });
+                }
+                if let Some(cmd) = execute_now {
+                    self.run_dsl(&cmd);
+                }
             });
+
+        // Unified `Ctrl+K` Command Palette Modal (driven by `biomol_script::COMMAND_REGISTRY`)
+        if self.palette_open {
+            let mut close_pal = false;
+            let mut chosen_cmd: Option<(String, bool)> = None;
+            egui::Window::new("BiomolCraft Command Palette (Ctrl+K)")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(580.0)
+                .default_height(380.0)
+                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 56.0))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut self.palette_query)
+                                .desired_width(ui.available_width() - 62.0)
+                                .hint_text("Type command, category, or keyword (e.g. session, glycan, vop, push, morph)..."),
+                        );
+                        r.request_focus();
+                        if ui.button("Close").clicked() {
+                            close_pal = true;
+                        }
+                    });
+                    ui.separator();
+                    let matches = filter_command_palette(&self.palette_query);
+                    if ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        && let Some(first) = matches.first()
+                    {
+                        let run_direct = !first.syntax.contains('<') && !first.syntax.contains('[');
+                        chosen_cmd = Some((
+                            if run_direct {
+                                first.name.to_string()
+                            } else {
+                                format!("{} ", first.name)
+                            },
+                            run_direct,
+                        ));
+                    }
+                    ui.small(format!(
+                        "{} matching command(s) — click to insert/run, Esc to close",
+                        matches.len()
+                    ));
+                    egui::ScrollArea::vertical()
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            for spec in matches.iter().take(40) {
+                                let run_direct =
+                                    !spec.syntax.contains('<') && !spec.syntax.contains('[');
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(56, 189, 248),
+                                        format!("[{}]", spec.category),
+                                    );
+                                    if ui.button(spec.syntax).clicked() {
+                                        chosen_cmd = Some((
+                                            if run_direct {
+                                                spec.name.to_string()
+                                            } else {
+                                                format!("{} ", spec.name)
+                                            },
+                                            run_direct,
+                                        ));
+                                    }
+                                });
+                                ui.small(spec.description);
+                                ui.separator();
+                            }
+                        });
+                });
+            if close_pal {
+                self.palette_open = false;
+            }
+            if let Some((txt, run_direct)) = chosen_cmd {
+                self.palette_open = false;
+                if run_direct {
+                    self.run_dsl(&txt);
+                } else {
+                    self.console_input = txt;
+                }
+            }
+        }
 
         // Left Panel: Multi-Model Panel (#1..#N), Online Fetch, Representations, Colors, Side View & Scenes
         egui::SidePanel::left("biomol_scene_tree")
@@ -1881,7 +2081,37 @@ impl BiomolCraftApp {
     }
 
     fn ui_suite_plugins_module(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Craft Link v1 · ArtCraft Export · WASM/JSON Plugins");
+        ui.heading("Craft Link v1 · Portable Sessions · Live ArtCraft Push · Plugins");
+        ui.strong("Portable Verified Session (.biomol.zip — PyMOL .pse / ChimeraX .cxs):");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.session_zip_path)
+                    .desired_width(210.0)
+                    .hint_text("/tmp/session.biomol.zip"),
+            );
+            if ui.small_button("Save").clicked() {
+                let p = self.session_zip_path.clone();
+                self.run_dsl(&format!("save_session {p}"));
+            }
+            if ui.small_button("Load").clicked() {
+                let p = self.session_zip_path.clone();
+                self.run_dsl(&format!("load_session {p}"));
+            }
+        });
+        ui.separator();
+        ui.strong("Live Push to ArtCraft Suite (Craft Link v1 + Full Bundle):");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Push Figure → WordCraft").clicked() {
+                self.run_dsl("push_artcraft wordcraft /tmp/biomolcraft_push_wordcraft");
+            }
+            if ui.button("Push Slide → DeckCraft").clicked() {
+                self.run_dsl("push_artcraft deckcraft /tmp/biomolcraft_push_deckcraft");
+            }
+            if ui.button("Push Table → GridCraft").clicked() {
+                self.run_dsl("push_artcraft gridcraft /tmp/biomolcraft_push_gridcraft");
+            }
+        });
+        ui.separator();
         ui.horizontal(|ui| {
             if ui.button("Scan Craft Link v1 Peers").clicked() {
                 match discover_craft_instances(None, None) {
@@ -2459,7 +2689,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1520.0, 920.0])
             .with_title(
-                "BiomolCraft v0.6.0 — CraftBio Biomolecular 3D Studio, SNFG, Sym, vop & ViewDockX",
+                "BiomolCraft v1.0.0 — CraftBio Biomolecular 3D Studio, Command Palette, .biomol.zip & ViewDockX",
             ),
         ..Default::default()
     };

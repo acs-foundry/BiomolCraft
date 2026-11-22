@@ -6,12 +6,13 @@
 use std::path::Path;
 
 use biomol_rna::{analyze_ncrna_mrna, find_rna_preset};
-use biomol_script::BiomolSession;
+use biomol_script::{BiomolSession, decode_session_zip_bytes, encode_session_zip_bytes};
 use craft_mcp_server::{
     Effect, Info, Options, Server, Tools, image_result, object, string, text_result, tool,
 };
 use craftbio_report::write_biomol_html_dossier;
 use craftbio_sandbox::PathSandbox;
+use craftbio_scene::ArtCraftTarget;
 use craftbio_struct::{write_mmcif, write_pdb};
 use craftbio_viewport::render_scene_png_bytes;
 use serde_json::{Value, json};
@@ -342,6 +343,39 @@ impl Tools for BiomolTools {
                     &["op"],
                 ),
                 Effect::Edits,
+            ),
+            tool(
+                "save_biomol_session",
+                "Save Verified Portable Session (.biomol.zip)",
+                "Save the complete multi-model BiomolCraft session (models, camera, scenes, labels, Color Key, Scale Bar, volume, ViewDockX, provenance) to a CRC-32 verified .biomol.zip archive inside the sandbox write root.",
+                object(
+                    json!({ "out_path": string("Output filename (.biomol.zip) inside sandbox write root") }),
+                    &["out_path"],
+                ),
+                Effect::Files,
+            ),
+            tool(
+                "load_biomol_session",
+                "Load Verified Portable Session (.biomol.zip)",
+                "Read, verify (CRC-32, traversal & decompression-bomb guards), and restore a portable .biomol.zip session from inside the sandbox read root.",
+                object(
+                    json!({ "path": string("Relative or sandbox-confined path to .biomol.zip archive") }),
+                    &["path"],
+                ),
+                Effect::Replaces,
+            ),
+            tool(
+                "push_to_artcraft",
+                "Push Figure/Slide/Table to ArtCraft Suite",
+                "Export a publication PNG + GridCraft TSV + WordCraft/DeckCraft Markdown bundle inside the sandbox write root and live-push it to WordCraft, DeckCraft, or GridCraft over Craft Link v1.",
+                object(
+                    json!({
+                        "target": string("wordcraft | deckcraft | gridcraft"),
+                        "out_dir": string("Relative directory name inside sandbox write root")
+                    }),
+                    &["target", "out_dir"],
+                ),
+                Effect::Files,
             ),
         ]
     }
@@ -842,6 +876,89 @@ impl Tools for BiomolTools {
                     Err(e) => text_result(e.to_string(), true),
                 }
             }
+            "save_biomol_session" => {
+                let out = args
+                    .get("out_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("session.biomol.zip");
+                self.session.sync_active_render_opts();
+                match encode_session_zip_bytes(&self.session) {
+                    Ok((bytes, sum)) => match self.sandbox.write_bytes(Path::new(out), &bytes) {
+                        Ok(safe_p) => text_result(
+                            format!(
+                                "Saved verified portable session to {} ({} bytes, {} models, {} scenes, volume={}, viewdock={}).",
+                                safe_p.display(),
+                                sum.archive_bytes,
+                                sum.model_count,
+                                sum.scene_count,
+                                sum.has_volume_mrc,
+                                sum.has_viewdock
+                            ),
+                            false,
+                        ),
+                        Err(e) => text_result(format!("sandbox write rejected: {e}"), true),
+                    },
+                    Err(e) => text_result(e.to_string(), true),
+                }
+            }
+            "load_biomol_session" => {
+                let p = args.get("path").and_then(Value::as_str).unwrap_or("");
+                match self.sandbox.read_bytes(Path::new(p)) {
+                    Ok(raw) => match decode_session_zip_bytes(&raw) {
+                        Ok((restored, sum)) => {
+                            self.session = restored;
+                            text_result(
+                                format!(
+                                    "Loaded verified portable session '{}' ({} bytes, {} models, {} atoms, {} scenes, volume={}, viewdock={}).",
+                                    p,
+                                    sum.archive_bytes,
+                                    sum.model_count,
+                                    sum.total_atoms,
+                                    sum.scene_count,
+                                    sum.has_volume_mrc,
+                                    sum.has_viewdock
+                                ),
+                                false,
+                            )
+                        }
+                        Err(e) => text_result(format!("session verification failed: {e}"), true),
+                    },
+                    Err(e) => text_result(format!("sandbox read rejected: {e}"), true),
+                }
+            }
+            "push_to_artcraft" => {
+                let tgt_s = args
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .unwrap_or("wordcraft");
+                let out_dir = args
+                    .get("out_dir")
+                    .and_then(Value::as_str)
+                    .unwrap_or("artcraft_bundle");
+                let Some(tgt) = ArtCraftTarget::parse(tgt_s) else {
+                    return text_result(
+                        format!(
+                            "unknown ArtCraft target '{tgt_s}' (use wordcraft|deckcraft|gridcraft)"
+                        ),
+                        true,
+                    );
+                };
+                // Enforce sandbox write confinement via preflight marker inside the target directory
+                let sentinel = Path::new(out_dir).join(".craftbio_push");
+                match self.sandbox.write_bytes(&sentinel, b"ok") {
+                    Ok(safe_sentinel) => {
+                        let safe_dir = safe_sentinel
+                            .parent()
+                            .map_or_else(|| safe_sentinel.clone(), Path::to_path_buf);
+                        let _ = std::fs::remove_file(&safe_sentinel);
+                        match self.session.push_artcraft_target(tgt, &safe_dir) {
+                            Ok(res) => text_result(res.message, false),
+                            Err(e) => text_result(e.to_string(), true),
+                        }
+                    }
+                    Err(e) => text_result(format!("sandbox write rejected: {e}"), true),
+                }
+            }
             other => text_result(format!("unknown tool '{other}'"), true),
         }
     }
@@ -906,12 +1023,26 @@ mod tests {
             .pointer("/result/tools")
             .and_then(Value::as_array)
             .ok_or("no tools")?;
-        assert_eq!(tools.len(), 25);
+        assert_eq!(tools.len(), 28);
 
         let rna = srv
             .handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fold_ncrna_mrna","arguments":{"preset":"guanine_riboswitch"}}}"#)
             .ok_or("no rna reply")?;
         assert!(rna.contains("dot_bracket"));
+
+        // Wave 7 MCP roundtrip: build 3D structure -> save_biomol_session -> load_biomol_session
+        let built = srv
+            .handle_line(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"build_structure_3d","arguments":{"kind":"helix","sequence":"AKLTYW","chain":"A"}}}"#)
+            .ok_or("no build reply")?;
+        assert!(built.contains("Built 3D"));
+        let saved = srv
+            .handle_line(r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"save_biomol_session","arguments":{"out_path":"mcp_test.biomol.zip"}}}"#)
+            .ok_or("no save session reply")?;
+        assert!(saved.contains("Saved verified portable session"));
+        let loaded = srv
+            .handle_line(r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"load_biomol_session","arguments":{"path":"mcp_test.biomol.zip"}}}"#)
+            .ok_or("no load session reply")?;
+        assert!(loaded.contains("Loaded verified portable session"));
 
         let esc = srv
             .handle_line(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"load_biomolecule","arguments":{"path":"../../etc/passwd"}}}"#)

@@ -24,12 +24,15 @@ use biomol_physics::{
 use biomol_rna::{
     analyze_ncrna_mrna, find_rna_preset, render_rna_arc_svg, render_rna_markdown, rna_presets,
 };
-use biomol_script::{BiomolSession, fetch_structure_spec};
+use biomol_script::{
+    BiomolSession, COMMAND_REGISTRY, fetch_structure_spec, filter_command_palette,
+    inspect_session_zip, load_session_zip, render_registry_help, save_session_zip,
+};
 use clap::{Parser, Subcommand};
 use craftbio_report::{export_artcraft_bundle, write_biomol_html_dossier};
 use craftbio_sandbox::{DEFAULT_MAX_FILE_BYTES, PathSandbox, inspect_wasm_plugin};
 use craftbio_scene::{
-    CraftSceneDocument, DockCraftSceneBundle, discover_craft_instances,
+    ArtCraftTarget, CraftSceneDocument, DockCraftSceneBundle, discover_craft_instances,
     push_dockcraft_bundle_via_craft_link, push_scene_via_craft_link, send_dsl_via_craft_link,
     send_trajectory_via_craft_link,
 };
@@ -551,6 +554,61 @@ enum Commands {
         out_mrc: Option<PathBuf>,
         #[arg(long)]
         out_png: Option<PathBuf>,
+    },
+    /// Save, inspect, or render a CRC-32 verified portable `.biomol.zip` session (PyMOL `.pse` / ChimeraX `.cxs`).
+    Session {
+        #[arg(long, default_value = "inspect", help = "save | inspect | render")]
+        action: String,
+        #[arg(long, help = "Path to .biomol.zip session archive")]
+        session: PathBuf,
+        #[arg(long, help = "Primary PDB/mmCIF when --action save")]
+        pdb: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Optional second PDB/mmCIF to add as #2 when --action save"
+        )]
+        add_pdb: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Optional DSL commands to execute before saving or rendering"
+        )]
+        dsl: Option<String>,
+        #[arg(long, help = "Optional PNG output when --action render")]
+        out_png: Option<PathBuf>,
+        #[arg(long, default_value_t = 1600)]
+        width: u32,
+        #[arg(long, default_value_t = 1200)]
+        height: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export full PNG + TSV + Markdown bundle & live-push over Craft Link v1 to WordCraft, DeckCraft, or GridCraft.
+    PushArtcraft {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(
+            long,
+            default_value = "wordcraft",
+            help = "wordcraft | deckcraft | gridcraft"
+        )]
+        target: String,
+        #[arg(
+            long,
+            help = "Optional module overlay: antibodies | ncrna | enzymes | adc"
+        )]
+        module: Option<String>,
+        #[arg(long, default_value = "/tmp/biomolcraft_artcraft_push")]
+        out_dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Introspect the unified typed BiomolCraft Command Registry (`COMMAND_REGISTRY`).
+    #[command(name = "commands", alias = "registry")]
+    Registry {
+        #[arg(long, help = "Optional keyword filter")]
+        query: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1913,6 +1971,163 @@ fn run() -> Result<(), String> {
                     "Rendered Volumetric VOP PNG -> {} ({bytes} bytes).",
                     p.display()
                 );
+            }
+        }
+        Commands::Session {
+            action,
+            session,
+            pdb,
+            add_pdb,
+            dsl,
+            out_png,
+            width,
+            height,
+            json,
+        } => match action.to_ascii_lowercase().as_str() {
+            "save" => {
+                let mut sess = BiomolSession::default();
+                if let Some(p) = pdb {
+                    sess.load_structure_file(&p).map_err(|e| e.to_string())?;
+                }
+                if let Some(p2) = add_pdb {
+                    sess.add_structure_file(&p2).map_err(|e| e.to_string())?;
+                }
+                if let Some(script) = dsl {
+                    let _ = sess.execute_dsl(&script).map_err(|e| e.to_string())?;
+                }
+                sess.sync_active_render_opts();
+                let sum = save_session_zip(&sess, &session).map_err(|e| e.to_string())?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&sum).map_err(|e| e.to_string())?
+                    );
+                } else {
+                    println!(
+                        "Saved verified portable session {} ({} bytes, {} models, {} atoms, {} scenes, volume={}, viewdock={}).",
+                        session.display(),
+                        sum.archive_bytes,
+                        sum.model_count,
+                        sum.total_atoms,
+                        sum.scene_count,
+                        sum.has_volume_mrc,
+                        sum.has_viewdock
+                    );
+                }
+            }
+            "render" => {
+                let (mut sess, sum) = load_session_zip(&session).map_err(|e| e.to_string())?;
+                if let Some(script) = dsl {
+                    let _ = sess.execute_dsl(&script).map_err(|e| e.to_string())?;
+                }
+                let png_path = out_png.ok_or("`session --action render` requires --out-png")?;
+                let sc = sess.build_viewport_scene();
+                let bytes = write_scene_png(&sc, &sess.camera, width, height, false, &png_path)
+                    .map_err(|e| e.to_string())?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "session": sum,
+                            "out_png": png_path.display().to_string(),
+                            "png_bytes": bytes,
+                        }))
+                        .map_err(|e| e.to_string())?
+                    );
+                } else {
+                    println!(
+                        "Reloaded verified session {} ({} models, {} scenes) & rendered {}x{} PNG -> {} ({bytes} bytes).",
+                        session.display(),
+                        sum.model_count,
+                        sum.scene_count,
+                        width,
+                        height,
+                        png_path.display()
+                    );
+                }
+            }
+            _ => {
+                let sum = inspect_session_zip(&session).map_err(|e| e.to_string())?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&sum).map_err(|e| e.to_string())?
+                    );
+                } else {
+                    println!(
+                        "# BiomolCraft Verified Portable Session: {}\n",
+                        session.display()
+                    );
+                    println!(
+                        "- **Schema:** `{}` (BiomolCraft `v{}`) | **Archive Size:** `{} bytes`",
+                        sum.schema_version, sum.app_version, sum.archive_bytes
+                    );
+                    println!(
+                        "- **Models ({}):** `{:?}` (`{}` total atoms)",
+                        sum.model_count, sum.model_names, sum.total_atoms
+                    );
+                    println!(
+                        "- **Saved Scenes:** `{}` | **3D/2D Labels:** `{}/{}` | **Color Key:** `{}` | **Scale Bar:** `{}`",
+                        sum.scene_count,
+                        sum.label_3d_count,
+                        sum.label_2d_count,
+                        sum.has_color_key,
+                        sum.has_scale_bar
+                    );
+                    println!(
+                        "- **Cryo-EM Volume (.mrc):** `{}` | **ViewDockX:** `{}` ({} poses) | **Provenance Entries:** `{}`",
+                        sum.has_volume_mrc,
+                        sum.has_viewdock,
+                        sum.viewdock_poses,
+                        sum.provenance_entries
+                    );
+                }
+            }
+        },
+        Commands::PushArtcraft {
+            pdb,
+            target,
+            module,
+            out_dir,
+            json,
+        } => {
+            let tgt = ArtCraftTarget::parse(&target).ok_or_else(|| {
+                format!("unknown ArtCraft target '{target}' (use wordcraft|deckcraft|gridcraft)")
+            })?;
+            let mut sess = BiomolSession::default();
+            sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+            let _ = sess.execute_dsl("preset pub_white; scalebar 20");
+            if let Some(m) = module {
+                let _ = sess
+                    .execute_dsl(&format!("module {m}"))
+                    .map_err(|e| e.to_string())?;
+            }
+            let res = sess
+                .push_artcraft_target(tgt, &out_dir)
+                .map_err(|e| e.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&res).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("{}", res.message);
+            }
+        }
+        Commands::Registry { query, json } => {
+            let q = query.as_deref().unwrap_or("");
+            if json {
+                let specs = if q.is_empty() {
+                    COMMAND_REGISTRY.iter().collect::<Vec<_>>()
+                } else {
+                    filter_command_palette(q)
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&specs).map_err(|e| e.to_string())?
+                );
+            } else {
+                print!("{}", render_registry_help(q));
             }
         }
     }

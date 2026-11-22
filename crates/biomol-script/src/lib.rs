@@ -5,6 +5,8 @@
 //! Transactional Undo/Redo, and Provenance Evidence Log (shared by GUI, CLI & MCP).
 
 pub mod fetch;
+pub mod registry;
+pub mod session_zip;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -24,9 +26,10 @@ use biomol_physics::run_local_langevin_md;
 use biomol_rna::{analyze_ncrna_mrna, find_rna_preset, render_rna_markdown};
 use craftbio_report::{export_artcraft_bundle, write_biomol_html_dossier};
 use craftbio_scene::{
-    ColorKeyLegend, ColorScheme, CraftSceneDocument, DockCraftSceneBundle, GridBox3D, Label2D,
-    Label3D, LightingPreset, LineOverlay, ProvenanceEntry, ProvenanceKind, RepresentationKind,
-    ScaleBarSpec, SelectionBoxSnapshot, SphereOverlay,
+    ArtCraftPushPayload, ArtCraftPushResult, ArtCraftTarget, ColorKeyLegend, ColorScheme,
+    CraftSceneDocument, DockCraftSceneBundle, GridBox3D, Label2D, Label3D, LightingPreset,
+    LineOverlay, ProvenanceEntry, ProvenanceKind, RepresentationKind, ScaleBarSpec,
+    SelectionBoxSnapshot, SphereOverlay, push_to_artcraft_via_craft_link,
 };
 use craftbio_struct::{
     Biomolecule, GeometryAxis, GeometryPlane, MsaAlignment, PaeMatrix, ResidueClass, VolumeGrid3D,
@@ -45,7 +48,15 @@ use craftbio_viewport::{
     render_turntable_frames, write_movie_file, write_scene_png,
 };
 pub use fetch::{FetchedAsset, fetch_structure_spec};
+pub use registry::{
+    COMMAND_REGISTRY, CommandSpec, CompletionItem, autocomplete_dsl, filter_command_palette,
+    render_registry_help,
+};
 use serde::{Deserialize, Serialize};
+pub use session_zip::{
+    SessionZipSummary, decode_session_zip_bytes, encode_session_zip_bytes, inspect_session_zip,
+    load_session_zip, save_session_zip,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -136,7 +147,7 @@ pub struct ViewDockSession {
 pub struct BiomolSession {
     pub models: Vec<SceneModel>,
     pub active_model_idx: usize,
-    next_model_id: u32,
+    pub(crate) next_model_id: u32,
     pub scenes: BTreeMap<String, SavedScene>,
     pub viewdock: Option<ViewDockSession>,
     pub active_volume: Option<VolumeGrid3D>,
@@ -197,6 +208,68 @@ impl Default for BiomolSession {
 }
 
 impl BiomolSession {
+    pub(crate) fn next_model_id_counter(&self) -> u32 {
+        self.next_model_id
+    }
+
+    /// Export a publication PNG + GridCraft TSV + WordCraft/DeckCraft Markdown bundle and
+    /// live-push it over Craft Link v1 to `WordCraft`, `DeckCraft`, or `GridCraft`.
+    pub fn push_artcraft_target(
+        &mut self,
+        target: ArtCraftTarget,
+        out_dir: &Path,
+    ) -> Result<ArtCraftPushResult, ScriptError> {
+        let title = self
+            .active_molecule()
+            .map_or_else(|| "BiomolCraft Scene".to_string(), |m| m.title.clone());
+        let atom_cnt = self.active_molecule().map_or(0, |m| m.atoms.len());
+        let scene = self.build_viewport_scene();
+        let png = render_scene_png_bytes(&scene, &self.camera, 1600, 1200, false)
+            .map_err(|e| ScriptError::Command(e.to_string()))?;
+        let mut rows = vec![
+            ("Structure", title.clone()),
+            ("Models", self.models.len().to_string()),
+            ("Active Atoms", atom_cnt.to_string()),
+            (
+                "Representation",
+                self.render_opts.representation.label().to_string(),
+            ),
+            (
+                "Color Scheme",
+                self.render_opts.color_scheme.label().to_string(),
+            ),
+            ("Saved Scenes", self.scenes.len().to_string()),
+        ];
+        if let Some(ref vd) = self.viewdock {
+            rows.push(("ViewDockX Poses", vd.bundle.poses.len().to_string()));
+        }
+        let sum = export_artcraft_bundle(&title, &png, &rows, &self.last_module_markdown, out_dir)
+            .map_err(ScriptError::Command)?;
+
+        let markdown_path = match target {
+            ArtCraftTarget::DeckCraft => sum.deckcraft_slides_md.clone(),
+            ArtCraftTarget::WordCraft | ArtCraftTarget::GridCraft => sum.wordcraft_md.clone(),
+        };
+        let payload = ArtCraftPushPayload {
+            target,
+            title,
+            source_app: "biomolcraft".to_string(),
+            bundle_dir: sum.out_dir,
+            figure_png_path: sum.figure_png,
+            markdown_path,
+            table_tsv_path: sum.gridcraft_tsv,
+            summary_markdown: self.last_module_markdown.clone(),
+        };
+        let res = push_to_artcraft_via_craft_link(None, &payload)
+            .map_err(|e| ScriptError::Command(e.to_string()))?;
+        self.provenance.push(ProvenanceEntry {
+            kind: ProvenanceKind::InteractiveEdit,
+            source_app: format!("biomolcraft::push->{}", target.app_id()),
+            summary: res.message.clone(),
+        });
+        Ok(res)
+    }
+
     #[must_use]
     pub fn active_model(&self) -> Option<&SceneModel> {
         self.models.get(self.active_model_idx)
@@ -1293,18 +1366,28 @@ impl BiomolSession {
         let rest = parts.next().unwrap_or("").trim();
 
         match cmd.as_str() {
-            "help" => Ok(
-                "Commands: open <path> [add|replace] | fetch <1N8Z|af:UNIPROT|emdb:ID|pubchem:CID> | models | active <#id> | show <#id> | hide <#id> | close <#id|all> | scene <save|recall|list|delete> <name> | clip <near_a> <far_a> | clip reset | lighting <soft|flat|full|studio|pub_white> | preset <pub_white|pub_dark|chimerax_soft|pymol_ray> | ssao <0..1> | bg <dark|white> | select <name>, <expr> | style <cartoon|nucleic|sticks|spheres|surface|lines> | color <chain|ss|cpk|nucleotide|plddt|sap|esp|mlp> | surface <on|off|wireframe> | silhouettes <on|off> | export_mesh <out.glb|out.obj> | load_dock <bundle.json> | pose <idx> | gridbox <from_selection [pad] | cx cy cz sx sy sz> | align <mob_ch>, <ref_ch> | mutate <C:RES> <AA> | minimize [steps] | module <antibodies|ncrna|enzymes|adc> | anm | gbsa | md | molmap | open_map | fitmap | png <path> [W] [H] [transparent] | save <path> | undo | redo | reset"
-                    .to_string(),
-            ),
+            "help" => Ok(render_registry_help(rest)),
             "open" | "load" => {
                 if rest.is_empty() {
                     return Err(ScriptError::Command(
-                        "usage: open <path.pdb|cif|sdf> [add|replace]".to_string(),
+                        "usage: open <path.pdb|cif|sdf|biomol.zip> [add|replace]".to_string(),
                     ));
                 }
                 let toks: Vec<&str> = rest.split_whitespace().collect();
                 let path_s = toks[0].trim_matches('"');
+                if path_s.to_ascii_lowercase().ends_with(".biomol.zip") {
+                    let (restored, sum) = load_session_zip(Path::new(path_s))?;
+                    *self = restored;
+                    return Ok(format!(
+                        "Loaded verified portable session '{}' ({} models, {} atoms, {} scenes, volume={}, viewdock={}).",
+                        path_s,
+                        sum.model_count,
+                        sum.total_atoms,
+                        sum.scene_count,
+                        sum.has_volume_mrc,
+                        sum.has_viewdock
+                    ));
+                }
                 let mode = toks.get(1).copied().unwrap_or("");
                 let add_mode = mode.eq_ignore_ascii_case("add")
                     || (mode.is_empty() && !self.models.is_empty());
@@ -1314,9 +1397,53 @@ impl BiomolSession {
                     self.add_structure_file(Path::new(path_s))
                 }
             }
+            "save_session" | "pse" | "cxs" => {
+                if rest.is_empty() {
+                    return Err(ScriptError::Command(
+                        "usage: save_session <out.biomol.zip>".to_string(),
+                    ));
+                }
+                let p = Path::new(rest.trim_matches('"'));
+                self.sync_active_render_opts();
+                let sum = save_session_zip(self, p)?;
+                Ok(format!(
+                    "Saved verified portable session to {} ({} bytes, {} models, {} atoms, {} scenes, volume={}, viewdock={}).",
+                    p.display(),
+                    sum.archive_bytes,
+                    sum.model_count,
+                    sum.total_atoms,
+                    sum.scene_count,
+                    sum.has_volume_mrc,
+                    sum.has_viewdock
+                ))
+            }
+            "load_session" | "open_session" => {
+                if rest.is_empty() {
+                    return Err(ScriptError::Command(
+                        "usage: load_session <in.biomol.zip>".to_string(),
+                    ));
+                }
+                let p = Path::new(rest.trim_matches('"'));
+                let (restored, sum) = load_session_zip(p)?;
+                *self = restored;
+                Ok(format!(
+                    "Loaded verified portable session from {} ({} bytes, {} models, {} atoms, {} scenes, volume={}, viewdock={}).",
+                    p.display(),
+                    sum.archive_bytes,
+                    sum.model_count,
+                    sum.total_atoms,
+                    sum.scene_count,
+                    sum.has_volume_mrc,
+                    sum.has_viewdock
+                ))
+            }
             "fetch" => {
                 let asset = fetch_structure_spec(rest).map_err(ScriptError::Command)?;
-                let tag = if asset.cached_hit { "cache hit" } else { "downloaded" };
+                let tag = if asset.cached_hit {
+                    "cache hit"
+                } else {
+                    "downloaded"
+                };
                 if asset.is_volume_map {
                     let bytes = std::fs::read(&asset.local_path)?;
                     let grid = parse_mrc_map(&asset.canonical_id, &bytes)
@@ -1409,7 +1536,13 @@ impl BiomolSession {
             }
             "scene" => {
                 let toks: Vec<&str> = rest.split_whitespace().collect();
-                match toks.first().copied().unwrap_or("").to_ascii_lowercase().as_str() {
+                match toks
+                    .first()
+                    .copied()
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
                     "save" => {
                         let name = toks.get(1).copied().unwrap_or("f1");
                         Ok(self.save_scene(name))
@@ -1487,7 +1620,10 @@ impl BiomolSession {
                 self.render_opts.ssao_strength = v.clamp(0.0, 1.0);
                 self.sync_active_render_opts();
                 self.dirty_geometry = true;
-                Ok(format!("SSAO strength set to {:.2}.", self.render_opts.ssao_strength))
+                Ok(format!(
+                    "SSAO strength set to {:.2}.",
+                    self.render_opts.ssao_strength
+                ))
             }
             "bg" | "background" => {
                 match rest.to_ascii_lowercase().as_str() {
@@ -1715,7 +1851,9 @@ impl BiomolSession {
                     .filter_map(|s| s.parse::<f64>().ok())
                     .collect();
                 if nums.len() < 6 {
-                    return Err(ScriptError::Command("invalid numeric GridBox coords".to_string()));
+                    return Err(ScriptError::Command(
+                        "invalid numeric GridBox coords".to_string(),
+                    ));
                 }
                 let gb = GridBox3D {
                     center: [nums[0], nums[1], nums[2]],
@@ -1770,9 +1908,9 @@ impl BiomolSession {
                     .chars()
                     .next()
                     .ok_or_else(|| ScriptError::Command("missing chain id".to_string()))?;
-                let rseq: i32 = r_s
-                    .parse()
-                    .map_err(|_| ScriptError::Command("invalid residue sequence number".to_string()))?;
+                let rseq: i32 = r_s.parse().map_err(|_| {
+                    ScriptError::Command("invalid residue sequence number".to_string())
+                })?;
                 let aa = toks[1]
                     .chars()
                     .next()
@@ -1921,16 +2059,20 @@ impl BiomolSession {
                     .clone();
                 let key = rest.to_ascii_lowercase();
                 let visual = match key.as_str() {
-                    "antibodies" | "ab" | "vhh" => run_antibody_module(&mol, None, None)
-                        .map_err(ScriptError::Command)?
-                        .visual,
-                    "ncrna" | "rna" | "mrna" => run_ncrna_module(&mol)
-                        .map_err(ScriptError::Command)?
-                        .0,
+                    "antibodies" | "ab" | "vhh" => {
+                        run_antibody_module(&mol, None, None)
+                            .map_err(ScriptError::Command)?
+                            .visual
+                    }
+                    "ncrna" | "rna" | "mrna" => {
+                        run_ncrna_module(&mol).map_err(ScriptError::Command)?.0
+                    }
                     "enzymes" | "enzyme" => run_enzyme_module(&mol),
-                    "adc" => run_adc_module(&mol, "ggfg", "dxd", 8.0, false)
-                        .map_err(ScriptError::Command)?
-                        .0,
+                    "adc" => {
+                        run_adc_module(&mol, "ggfg", "dxd", 8.0, false)
+                            .map_err(ScriptError::Command)?
+                            .0
+                    }
                     other => {
                         return Err(ScriptError::Command(format!(
                             "unknown module '{other}' (use antibodies|ncrna|enzymes|adc)"
@@ -1994,17 +2136,29 @@ impl BiomolSession {
             "save" => {
                 if rest.is_empty() {
                     return Err(ScriptError::Command(
-                        "usage: save <out.pdb|out.cif|out.craftscene.json>".to_string(),
+                        "usage: save <out.pdb|out.cif|out.craftscene.json|out.biomol.zip>"
+                            .to_string(),
                     ));
                 }
-                let out = Path::new(rest);
-                if rest.ends_with(".json") {
+                let out = Path::new(rest.trim_matches('"'));
+                let low = rest.to_ascii_lowercase();
+                if low.ends_with(".biomol.zip") || low.ends_with(".zip") {
+                    self.sync_active_render_opts();
+                    let sum = save_session_zip(self, out)?;
+                    Ok(format!(
+                        "Saved verified portable session to {} ({} bytes, {} models, {} scenes).",
+                        out.display(),
+                        sum.archive_bytes,
+                        sum.model_count,
+                        sum.scene_count
+                    ))
+                } else if low.ends_with(".json") {
                     let doc = self.to_craftscene_document();
                     let text = serde_json::to_string_pretty(&doc)
                         .map_err(|e| ScriptError::Command(e.to_string()))?;
                     std::fs::write(out, text)?;
                     Ok(format!("Saved CraftScene JSON to {}.", out.display()))
-                } else if rest.ends_with(".cif") || rest.ends_with(".mmcif") {
+                } else if low.ends_with(".cif") || low.ends_with(".mmcif") {
                     let mol = self
                         .active_molecule()
                         .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
@@ -2093,9 +2247,9 @@ impl BiomolSession {
                 Ok(msg)
             }
             "frame" => {
-                let idx: usize = rest
-                    .parse()
-                    .map_err(|_| ScriptError::Command("usage: frame <0-based index>".to_string()))?;
+                let idx: usize = rest.parse().map_err(|_| {
+                    ScriptError::Command("usage: frame <0-based index>".to_string())
+                })?;
                 let mol = self
                     .active_molecule_mut()
                     .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
@@ -2205,10 +2359,7 @@ impl BiomolSession {
             }
             "denovo" => {
                 let toks: Vec<&str> = rest.split_whitespace().collect();
-                let ch = toks
-                    .first()
-                    .and_then(|s| s.chars().next())
-                    .unwrap_or('C');
+                let ch = toks.first().and_then(|s| s.chars().next()).unwrap_or('C');
                 let hotspots: Vec<String> = toks.iter().skip(1).map(|s| (*s).to_string()).collect();
                 let mol = self
                     .active_molecule()
@@ -2288,6 +2439,19 @@ impl BiomolSession {
                     sum.out_dir
                 ))
             }
+            "push_artcraft" | "push" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                let target_s = toks.first().copied().unwrap_or("wordcraft");
+                let target = ArtCraftTarget::parse(target_s).ok_or_else(|| {
+                    ScriptError::Command(format!(
+                        "unknown ArtCraft target '{target_s}' (use wordcraft|deckcraft|gridcraft)"
+                    ))
+                })?;
+                let default_dir = format!("/tmp/biomolcraft_push_{}", target.app_id());
+                let out_dir = toks.get(1).copied().unwrap_or(&default_dir);
+                let res = self.push_artcraft_target(target, Path::new(out_dir))?;
+                Ok(res.message)
+            }
             "putty" => {
                 let on = !matches!(rest.to_ascii_lowercase().as_str(), "off" | "false" | "0");
                 self.render_opts.representation = if on {
@@ -2311,7 +2475,10 @@ impl BiomolSession {
                 let hbs = detect_hbonds(&mol, None, None, max_d, 95.0);
                 for h in hbs.iter().take(250) {
                     self.render_opts.line_overlays.push(LineOverlay {
-                        label: format!("HBond {} - {} ({:.2} A)", h.label_a, h.label_b, h.distance_a),
+                        label: format!(
+                            "HBond {} - {} ({:.2} A)",
+                            h.label_a, h.label_b, h.distance_a
+                        ),
                         from: h.coords_a,
                         to: h.coords_b,
                         dashed: true,
@@ -2349,7 +2516,10 @@ impl BiomolSession {
                         0.5 * (c.coords_a[2] + c.coords_b[2]),
                     ];
                     self.render_opts.sphere_overlays.push(SphereOverlay {
-                        label: format!("Clash {} - {} ({:.2} A ov)", c.label_a, c.label_b, c.overlap_a),
+                        label: format!(
+                            "Clash {} - {} ({:.2} A ov)",
+                            c.label_a, c.label_b, c.overlap_a
+                        ),
                         category: "clash".to_string(),
                         coords: mid,
                         radius_a: (0.45 + 0.35 * c.overlap_a).clamp(0.45, 1.3),
@@ -2374,7 +2544,10 @@ impl BiomolSession {
                     ));
                 }
                 self.last_module_markdown = md;
-                let msg = format!("Detected {} steric clashes (overlap >= {ov:.2} Å).", clashes.len());
+                let msg = format!(
+                    "Detected {} steric clashes (overlap >= {ov:.2} Å).",
+                    clashes.len()
+                );
                 self.measurements_log.push(msg.clone());
                 self.sync_active_render_opts();
                 self.dirty_geometry = true;
@@ -2389,7 +2562,10 @@ impl BiomolSession {
                 let contacts = detect_contacts(&mol, None, None, cut, 200);
                 for c in contacts.iter().take(150) {
                     self.render_opts.line_overlays.push(LineOverlay {
-                        label: format!("Contact {} - {} ({:.2} A)", c.label_a, c.label_b, c.distance_a),
+                        label: format!(
+                            "Contact {} - {} ({:.2} A)",
+                            c.label_a, c.label_b, c.distance_a
+                        ),
                         from: c.coords_a,
                         to: c.coords_b,
                         dashed: true,
@@ -2504,7 +2680,10 @@ impl BiomolSession {
                 );
                 if let Some(prev) = self.axes.last() {
                     let ang = axis_angle_deg(prev.direction, ax.direction, true);
-                    msg.push_str(&format!(" Inter-axis angle vs '{}' = {ang:.1}°.", prev.label));
+                    msg.push_str(&format!(
+                        " Inter-axis angle vs '{}' = {ang:.1}°.",
+                        prev.label
+                    ));
                 }
                 self.labels_3d.push(Label3D {
                     text: ax.label.clone(),
@@ -2553,7 +2732,10 @@ impl BiomolSession {
                 );
                 if let Some(prev) = self.planes.last() {
                     let ang = axis_angle_deg(prev.normal, pl.normal, true);
-                    msg.push_str(&format!(" Inter-plane angle vs '{}' = {ang:.1}°.", prev.label));
+                    msg.push_str(&format!(
+                        " Inter-plane angle vs '{}' = {ang:.1}°.",
+                        prev.label
+                    ));
                 }
                 self.labels_3d.push(Label3D {
                     text: pl.label.clone(),
@@ -2734,7 +2916,10 @@ impl BiomolSession {
                 );
                 for row in &msa.rows {
                     let seq: String = row.aligned_chars.iter().take(80).collect();
-                    md.push_str(&format!("{:<14} [{}] {}\n", row.model_name, row.chain_id, seq));
+                    md.push_str(&format!(
+                        "{:<14} [{}] {}\n",
+                        row.model_name, row.chain_id, seq
+                    ));
                 }
                 md.push_str("```\n");
                 let msg = format!(
@@ -3024,10 +3209,7 @@ impl BiomolSession {
                 }
                 let kind = toks[0].to_ascii_lowercase();
                 let seq = toks[1];
-                let chain = toks
-                    .get(2)
-                    .and_then(|s| s.chars().next())
-                    .unwrap_or('A');
+                let chain = toks.get(2).and_then(|s| s.chars().next()).unwrap_or('A');
                 let mol = if kind == "rna" || kind == "duplex" {
                     build_de_novo_rna_helix_3d(seq, chain)
                 } else {
@@ -3068,7 +3250,10 @@ impl BiomolSession {
                     (mol.altlocs.len(), md)
                 };
                 if n_alt == 0 {
-                    Ok("No alternate conformations (altlocs) detected in active structure.".to_string())
+                    Ok(
+                        "No alternate conformations (altlocs) detected in active structure."
+                            .to_string(),
+                    )
                 } else {
                     self.last_module_markdown = md;
                     Ok(format!(
@@ -3097,7 +3282,9 @@ impl BiomolSession {
                 let cnt = renumber_chain(mol, ch, start)
                     .map_err(|e| ScriptError::Command(e.to_string()))?;
                 self.dirty_geometry = true;
-                Ok(format!("Renumbered {cnt} residues in chain {ch} starting at {start}."))
+                Ok(format!(
+                    "Renumbered {cnt} residues in chain {ch} starting at {start}."
+                ))
             }
             "changechains" => {
                 let toks: Vec<&str> = rest.split_whitespace().collect();
@@ -3178,7 +3365,9 @@ impl BiomolSession {
                     .map_err(|e| ScriptError::Command(e.to_string()))?;
                 let copies = mol.biomt_ops.len();
                 let msg = self.insert_model(bio, None, "bioassembly", false);
-                Ok(format!("Generated Biological Assembly ({copies} BIOMT ops). {msg}"))
+                Ok(format!(
+                    "Generated Biological Assembly ({copies} BIOMT ops). {msg}"
+                ))
             }
             "symexp" | "crystalcontacts" => {
                 let cut: f64 = rest.parse().unwrap_or(5.0);
@@ -3219,7 +3408,9 @@ impl BiomolSession {
                             )
                         },
                     );
-                Ok(format!("Crystallographic Unit Cell wireframe: {on} ({info})."))
+                Ok(format!(
+                    "Crystallographic Unit Cell wireframe: {on} ({info})."
+                ))
             }
             "snfg" | "glycans" => {
                 let on = !matches!(rest.to_ascii_lowercase().as_str(), "off" | "false" | "0");
@@ -3256,7 +3447,11 @@ impl BiomolSession {
                 let sub = toks.first().copied().unwrap_or("").to_ascii_lowercase();
                 if sub == "orthoplanes" || sub == "ortho" {
                     let on = !matches!(
-                        toks.get(1).copied().unwrap_or("on").to_ascii_lowercase().as_str(),
+                        toks.get(1)
+                            .copied()
+                            .unwrap_or("on")
+                            .to_ascii_lowercase()
+                            .as_str(),
                         "off" | "false" | "0"
                     );
                     self.show_orthoplanes = on;
@@ -3576,6 +3771,78 @@ $$$$
         assert!(sess.show_orthoplanes);
         let sc = sess.build_viewport_scene();
         assert!(sc.transparent_meshes.len() >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn wave7_registry_autocomplete_portable_zip_session_and_artcraft_push()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // 1. Unified Typed Command Registry + [TAB] Autocomplete + Palette filter
+        assert!(COMMAND_REGISTRY.len() >= 65);
+        let ac_cmd = autocomplete_dsl("save_s");
+        assert!(
+            ac_cmd
+                .iter()
+                .any(|c| c.insert_text.starts_with("save_session"))
+        );
+        let ac_sub = autocomplete_dsl("vop sh");
+        assert!(ac_sub.iter().any(|c| c.insert_text == "vop sharpen"));
+        let ac_chain = autocomplete_dsl("preset pub_white; push_artcraft de");
+        assert!(
+            ac_chain
+                .iter()
+                .any(|c| c.insert_text == "preset pub_white; push_artcraft deckcraft")
+        );
+        let pal = filter_command_palette("glycan");
+        assert!(pal.iter().any(|c| c.name == "snfg"));
+
+        // 2. Build rich multi-model + Scene + Labels + Key + ScaleBar + Volume + ViewDockX session
+        let mut sess = BiomolSession::default();
+        let _ = sess.execute_dsl(
+            "build helix AKLTYWDS A; build rna GCGCUA B; active #1; preset pub_white; key plddt; scalebar 20; 2dlabel 0.03 0.03 Wave7; label A:1:CA Start; molmap 4.5 1.5; vop orthoplanes on; scene save f1; scene save f2",
+        )?;
+        assert_eq!(sess.models.len(), 2);
+        assert_eq!(sess.scenes.len(), 2);
+        assert!(sess.active_volume.is_some());
+
+        // 3. Save to verified .biomol.zip, inspect, reload into clean BiomolSession, assert parity!
+        let zip_path =
+            std::env::temp_dir().join(format!("biomol_w7_sess_{}.biomol.zip", std::process::id()));
+        let save_msg = sess.execute_dsl(&format!("save_session {}", zip_path.display()))?;
+        assert!(save_msg.contains("Saved verified portable session"));
+
+        let inspected = inspect_session_zip(&zip_path)?;
+        assert_eq!(inspected.schema_version, "biomol-session/v1");
+        assert_eq!(inspected.model_count, 2);
+        assert_eq!(inspected.scene_count, 2);
+        assert!(inspected.has_volume_mrc);
+        assert!(inspected.has_color_key && inspected.has_scale_bar);
+
+        let mut fresh = BiomolSession::default();
+        let load_msg = fresh.execute_dsl(&format!("load_session {}", zip_path.display()))?;
+        assert!(load_msg.contains("Loaded verified portable session"));
+        assert_eq!(fresh.models.len(), 2);
+        assert_eq!(fresh.scenes.len(), 2);
+        assert!(fresh.active_volume.is_some());
+        assert!(fresh.show_orthoplanes);
+        assert_eq!(fresh.labels_3d.len(), 1);
+        assert_eq!(fresh.labels_2d.len(), 1);
+        assert!(fresh.color_key.is_some());
+        assert!(fresh.scale_bar.is_some());
+        let sc = fresh.build_viewport_scene();
+        assert!(!sc.opaque_meshes.is_empty());
+
+        // 4. ArtCraft Push (writes full PNG + TSV + WordCraft/DeckCraft MD + Craft Link check)
+        let push_dir = std::env::temp_dir().join(format!("biomol_w7_push_{}", std::process::id()));
+        let push_msg =
+            fresh.execute_dsl(&format!("push_artcraft wordcraft {}", push_dir.display()))?;
+        assert!(push_msg.contains("WordCraft"));
+        assert!(push_dir.join("report_wordcraft.md").is_file());
+        assert!(push_dir.join("table_gridcraft.tsv").is_file());
+        assert!(push_dir.join("figure_biomolcraft.png").is_file());
+
+        let _ = std::fs::remove_file(&zip_path);
+        let _ = std::fs::remove_dir_all(&push_dir);
         Ok(())
     }
 }
