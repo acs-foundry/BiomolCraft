@@ -1,0 +1,15 @@
+[package]
+name = "bio-develop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "L1: TAP 5-metric developability, 3D SAP aggregation patches, CDR/FR chemical PTMs, HLA-DRB1 MHC-II immunogenicity & de-immunization, codon optimization, and binder format matrix"
+
+[lints]
+workspace = true
+
+[dependencies]
+bio-core = { path = "../bio-core" }
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true

@@ -176,7 +176,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bio-adc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "bio-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rayon",
  "serde",
@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "bio-develop"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bio-core",
  "rayon",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "bio-engine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bio-adc",
  "bio-develop",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "bio-interface"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bio-core",
  "serde",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "biomol-enzyme"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "craftbio-scene",
  "craftbio-struct",
@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "biomol-model"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "craftbio-scene",
  "craftbio-struct",
@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "biomol-modules"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bio-adc",
  "bio-core",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "biomol-physics"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "craftbio-report",
  "craftbio-scene",
@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "biomol-rna"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "craftbio-report",
  "craftbio-struct",
@@ -284,7 +284,7 @@ dependencies = [
 
 [[package]]
 name = "biomol-script"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "biomol-enzyme",
  "biomol-model",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "biomolcraft"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "biomol-enzyme",
  "biomol-model",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "biomolcraft-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "biomol-enzyme",
  "biomol-model",
@@ -679,6 +679,7 @@ dependencies = [
 [[package]]
 name = "craftbio-report"
 version = "0.2.0"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v0.2.0#39ceaf76991738fd6b56deacd4eecb4400b0bc79"
 dependencies = [
  "serde_json",
 ]
@@ -686,6 +687,7 @@ dependencies = [
 [[package]]
 name = "craftbio-sandbox"
 version = "0.2.0"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v0.2.0#39ceaf76991738fd6b56deacd4eecb4400b0bc79"
 dependencies = [
  "rustix 1.1.6",
  "thiserror 2.0.21",
@@ -694,6 +696,7 @@ dependencies = [
 [[package]]
 name = "craftbio-scene"
 version = "0.2.0"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v0.2.0#39ceaf76991738fd6b56deacd4eecb4400b0bc79"
 dependencies = [
  "craft-ipc",
  "serde",
@@ -704,6 +707,7 @@ dependencies = [
 [[package]]
 name = "craftbio-struct"
 version = "0.2.0"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v0.2.0#39ceaf76991738fd6b56deacd4eecb4400b0bc79"
 dependencies = [
  "rayon",
  "serde",
@@ -713,6 +717,7 @@ dependencies = [
 [[package]]
 name = "craftbio-viewport"
 version = "0.2.0"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v0.2.0#39ceaf76991738fd6b56deacd4eecb4400b0bc79"
 dependencies = [
  "bytemuck",
  "craftbio-scene",

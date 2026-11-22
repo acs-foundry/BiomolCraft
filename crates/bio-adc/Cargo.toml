@@ -1,0 +1,13 @@
+[package]
+name = "bio-adc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "L2: Antibody-Drug Conjugate (ADC) architect (linkers, payloads, DAR, bystander permeability) & Biologics Minimal-PBPK + FcRn + TMDD human PK/RO% ODE simulator"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true

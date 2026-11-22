@@ -1,0 +1,13 @@
+[package]
+name = "bio-interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "L2: 3D PPI epitope/paratope mapping, ΔBSA, computational Alanine Scanning ΔΔG hotspots, saturation mutagenesis, and opt-in RFdiffusion/ProteinMPNN/ESM2/Boltz-2 bridges"
+
+[lints]
+workspace = true
+
+[dependencies]
+bio-core = { path = "../bio-core" }
+serde.workspace = true

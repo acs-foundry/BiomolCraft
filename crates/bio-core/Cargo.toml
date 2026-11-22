@@ -1,0 +1,14 @@
+[package]
+name = "bio-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "L0: Pure-Rust FASTA/PDB/mmCIF parser, Shrake-Rupley 3D SASA, IMGT/Kabat antibody & VHH numbering, germline humanization, and clinical biologics presets"
+
+[lints]
+workspace = true
+
+[dependencies]
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true

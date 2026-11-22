@@ -1,0 +1,19 @@
+[package]
+name = "bio-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "L3: Kernel-confined openat2 PathSandbox (via craftbio-sandbox), project state, and ChemCraft/AdmetCraft/DockCraft/BiomolCraft Craft Link v1 IPC bridges"
+
+[lints]
+workspace = true
+
+[dependencies]
+bio-adc = { path = "../bio-adc" }
+bio-develop = { path = "../bio-develop" }
+bio-interface = { path = "../bio-interface" }
+craftbio-sandbox.workspace = true
+craftbio-scene.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

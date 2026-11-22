@@ -77,7 +77,7 @@ impl Default for BiomolCraftApp {
         let link_server =
             CraftBioLinkServer::start("biomolcraft", env!("CARGO_PKG_VERSION"), None).ok();
         let link_status = if link_server.is_some() {
-            "Craft Link v1 socket active (ready for BioCraft/DockCraft/ChemCraft/ArtCraft)."
+            "Craft Link v1 socket active (ready for DockCraft/ChemCraft/AdmetCraft/ArtCraft)."
         } else {
             "Local standalone session."
         };
@@ -370,7 +370,6 @@ impl eframe::App for BiomolCraftApp {
                 });
                 ui.menu_button("Suite (CraftBio & ArtCraft)", |ui| {
                     for (lbl, bin) in [
-                        ("BioCraft (Dedicated Biologics Studio)", "biocraft"),
                         ("ChemCraft (Small-Mol, Synthesis & NRPs)", "chemcraft"),
                         ("DockCraft (SBDD Docking & FEP)", "dockcraft"),
                         ("AdmetCraft (ADMET & PBPK)", "admetcraft"),
@@ -383,7 +382,7 @@ impl eframe::App for BiomolCraftApp {
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        egui::RichText::new("BiomolCraft v0.1.0 · CraftBio 3D Biomolecular Studio")
+                        egui::RichText::new("BiomolCraft v0.2.1 · CraftBio 3D Biomolecular Studio")
                             .strong()
                             .color(egui::Color32::from_rgb(56, 189, 248)),
                     );
@@ -755,7 +754,7 @@ impl BiomolCraftApp {
     }
 
     fn ui_antibody_module(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Antibodies & VHH Module (BioCraft Engine)");
+        ui.heading("Antibodies & VHH Module (IMGT · TAP · Ala-Scan)");
         if ui
             .button("Analyze & Paint CDRs / Ala-Scan Hotspots in 3D")
             .clicked()

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/bio-core",
+    "crates/bio-develop",
+    "crates/bio-interface",
+    "crates/bio-adc",
+    "crates/bio-engine",
     "crates/biomol-model",
     "crates/biomol-rna",
     "crates/biomol-physics",
@@ -12,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
@@ -33,21 +38,19 @@ unreachable = "deny"
 # Upstream ArtCraft shared libraries (storytold/craft-libs pinned commit)
 craft-mcp-server = { git = "https://github.com/storytold/craft-libs", rev = "52d2560c183b2df8b1ffc25ca2078683af146fd6" }
 
-# CraftBio shared libraries (acs-foundry/craftbio-libs)
-craftbio-sandbox = { path = "../craftbio-libs/crates/sandbox" }
-craftbio-struct = { path = "../craftbio-libs/crates/struct" }
-craftbio-scene = { path = "../craftbio-libs/crates/scene" }
-craftbio-viewport = { path = "../craftbio-libs/crates/viewport" }
-craftbio-report = { path = "../craftbio-libs/crates/report" }
+# CraftBio shared libraries (public acs-foundry/craftbio-libs pinned tag)
+craftbio-sandbox = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v0.2.0" }
+craftbio-struct = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v0.2.0" }
+craftbio-scene = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v0.2.0" }
+craftbio-viewport = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v0.2.0" }
+craftbio-report = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v0.2.0" }
 
-# BioCraft compute crates mounted as loadable BiomolCraft modules (zero duplication)
-bio-core = { path = "../BioCraft/crates/bio-core" }
-bio-develop = { path = "../BioCraft/crates/bio-develop" }
-bio-interface = { path = "../BioCraft/crates/bio-interface" }
-bio-adc = { path = "../BioCraft/crates/bio-adc" }
-bio-engine = { path = "../BioCraft/crates/bio-engine" }
-
-# Internal BiomolCraft crates
+# Internal BiomolCraft biologics, modeling, physics & module crates (100% self-contained)
+bio-core = { path = "crates/bio-core" }
+bio-develop = { path = "crates/bio-develop" }
+bio-interface = { path = "crates/bio-interface" }
+bio-adc = { path = "crates/bio-adc" }
+bio-engine = { path = "crates/bio-engine" }
 biomol-model = { path = "crates/biomol-model" }
 biomol-rna = { path = "crates/biomol-rna" }
 biomol-physics = { path = "crates/biomol-physics" }
@@ -59,6 +62,7 @@ biomol-script = { path = "crates/biomol-script" }
 clap = { version = "4.5", features = ["derive"] }
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
 egui = "0.31"
+rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
