@@ -11,8 +11,10 @@ description = "PyMOL/ChimeraX-compatible command DSL, transactional Undo/Redo bi
 workspace = true
 
 [dependencies]
+biomol-enzyme.workspace = true
 biomol-model.workspace = true
 biomol-modules.workspace = true
+biomol-physics.workspace = true
 biomol-rna.workspace = true
 craftbio-scene.workspace = true
 craftbio-struct.workspace = true

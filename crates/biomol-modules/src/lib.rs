@@ -19,11 +19,19 @@ use bio_interface::{
     AlaScanReport, InterfaceReport, analyze_ppi_interface, render_interface_markdown,
     run_alanine_scan,
 };
+use biomol_enzyme::{
+    EnzymeEngineeringReport, analyze_enzyme_engineering, enzyme_visual_overlays,
+    render_enzyme_markdown,
+};
+use biomol_physics::{
+    AnmReport, GbSaReport, anm_mode_porcupine_overlays, compute_anm_modes, compute_gbsa_energy,
+    generate_anm_trajectory_frames, render_anm_markdown, render_gbsa_markdown,
+};
 use biomol_rna::{NcRnaAnalysisReport, analyze_ncrna_mrna, render_rna_markdown};
 use craftbio_scene::{
     ColorScheme, LineOverlay, ProvenanceEntry, ProvenanceKind, RepresentationKind, SphereOverlay,
 };
-use craftbio_struct::{Biomolecule, ResidueClass, compute_sasa, dist3, write_pdb};
+use craftbio_struct::{Biomolecule, ResidueClass, compute_sasa, write_pdb};
 use serde::{Deserialize, Serialize};
 
 /// First-class loadable biomolecular module identifiers inside `BiomolCraft`.
@@ -349,109 +357,40 @@ pub fn run_ncrna_module(
     Ok((out, reports))
 }
 
-/// Execute the **Enzymes & Active-Site Module**: detects metal/cofactor coordination spheres &
-/// classic Ser/Cys–His–Asp/Glu catalytic triads in 3D and highlights them directly in the viewport.
+/// Execute the **Enzymes & Protein Engineering Module** (`biomol-enzyme`): detects catalytic
+/// triads/dyads, metal/cofactor coordination spheres, 3D translucent substrate access tunnels,
+/// and thermostabilizing disulfide bridge proposals directly in the 3D viewport.
 #[must_use]
 pub fn run_enzyme_module(mol: &Biomolecule) -> ModuleExecutionOutput {
+    let (vis, _) = run_enzyme_engineering_module(mol);
+    vis
+}
+
+/// Full structured `biomol-enzyme` module execution returning both 3D overlays and report.
+#[must_use]
+pub fn run_enzyme_engineering_module(
+    mol: &Biomolecule,
+) -> (ModuleExecutionOutput, EnzymeEngineeringReport) {
+    let rep = analyze_enzyme_engineering(mol);
     let mut highlights: HashMap<(char, i32), [f32; 3]> = HashMap::new();
-    let mut spheres = Vec::new();
-    let mut lines = Vec::new();
-    let mut md = String::new();
-    let _ = writeln!(
-        md,
-        "# Enzyme Active-Site & Catalytic Triad Audit: {}\n",
-        mol.title
-    );
-
-    // 1. Metal & cofactor coordination sites (<= 2.9 A for ions, <= 4.2 A for organic cofactors)
-    let mut coord_hits = 0usize;
-    for a in &mol.atoms {
-        if a.res_class == ResidueClass::Ion {
-            spheres.push(SphereOverlay {
-                label: format!("Metal {}:{}{}", a.chain, a.res_name, a.res_seq),
-                category: "Catalytic Ion".to_string(),
-                coords: a.coords,
-                radius_a: 1.20,
-                rgba: [0.72, 0.35, 0.98, 0.85],
-            });
-            for b in &mol.atoms {
-                if b.res_class == ResidueClass::Protein
-                    && matches!(b.element.as_str(), "N" | "O" | "S")
-                    && dist3(a.coords, b.coords) <= 2.95
-                {
-                    highlights.insert((b.chain, b.res_seq), [0.85, 0.42, 0.98]);
-                    lines.push(LineOverlay {
-                        label: format!("Coord {:.2}Å", dist3(a.coords, b.coords)),
-                        from: a.coords,
-                        to: b.coords,
-                        dashed: true,
-                        rgba: [0.85, 0.45, 0.99, 0.95],
-                    });
-                    coord_hits += 1;
-                }
-            }
+    for m in &rep.catalytic_motifs {
+        for (idx, (ch, rseq, _)) in m.residues.iter().enumerate() {
+            let col = match idx {
+                0 => [0.20, 0.90, 0.55],
+                1 => [0.96, 0.25, 0.45],
+                _ => [0.98, 0.72, 0.16],
+            };
+            highlights.insert((*ch, *rseq), col);
         }
     }
-
-    // 2. Classic Ser/Cys – His – Asp/Glu catalytic triad geometry search (<= 6.5 A Cα/sidechain)
-    let mut his_list = Vec::new();
-    let mut nuc_list = Vec::new();
-    let mut acid_list = Vec::new();
-    for ch in &mol.chains {
-        for r in &ch.residues {
-            if r.class != ResidueClass::Protein {
-                continue;
-            }
-            let Some(gi) = r.guide_idx else { continue };
-            match r.code {
-                'H' => his_list.push((r.chain, r.res_seq, r.code, mol.atoms[gi].coords)),
-                'S' | 'C' => nuc_list.push((r.chain, r.res_seq, r.code, mol.atoms[gi].coords)),
-                'D' | 'E' => acid_list.push((r.chain, r.res_seq, r.code, mol.atoms[gi].coords)),
-                _ => {}
-            }
+    for s in &rep.metal_cofactor_sites {
+        for (ch, rseq, _, _) in &s.coordinating_residues {
+            highlights.entry((*ch, *rseq)).or_insert([0.82, 0.44, 0.98]);
         }
     }
-    let mut triads = Vec::new();
-    for &(hc, hr, _, hp) in &his_list {
-        for &(nc, nr, na, np) in &nuc_list {
-            if hc != nc || dist3(hp, np) > 7.2 {
-                continue;
-            }
-            for &(ac, ar, aa, ap) in &acid_list {
-                if ac != hc || dist3(hp, ap) > 7.2 {
-                    continue;
-                }
-                triads.push(format!("{hc}:{na}{nr} — H{hr} — {aa}{ar}"));
-                highlights.insert((hc, hr), [0.96, 0.25, 0.45]);
-                highlights.insert((nc, nr), [0.20, 0.90, 0.55]);
-                highlights.insert((ac, ar), [0.98, 0.72, 0.16]);
-                if triads.len() >= 6 {
-                    break;
-                }
-            }
-            if triads.len() >= 6 {
-                break;
-            }
-        }
-        if triads.len() >= 6 {
-            break;
-        }
-    }
-
-    let _ = writeln!(
-        md,
-        "- **Metal Coordination Bonds (`<= 2.95 Å`):** `{coord_hits}`"
-    );
-    let _ = writeln!(
-        md,
-        "- **Putative Catalytic Triads (`Ser/Cys–His–Asp/Glu`):** `{}`",
-        triads.len()
-    );
-    for t in &triads {
-        let _ = writeln!(md, "  - `{t}`");
-    }
-
-    ModuleExecutionOutput {
+    let (spheres, lines) = enzyme_visual_overlays(&rep);
+    let md = render_enzyme_markdown(&rep);
+    let vis = ModuleExecutionOutput {
         module_name: ModuleId::EnzymesCatalysis.label().to_string(),
         recommended_repr: Some(RepresentationKind::Cartoon),
         recommended_color: Some(ColorScheme::SecondaryStructure),
@@ -461,14 +400,103 @@ pub fn run_enzyme_module(mol: &Biomolecule) -> ModuleExecutionOutput {
         summary_markdown: md,
         provenance: vec![ProvenanceEntry {
             kind: ProvenanceKind::ComputationalPrediction,
-            source_app: "biomolcraft::mod-enzymes".to_string(),
+            source_app: "biomolcraft::biomol-enzyme".to_string(),
             summary: format!(
-                "Scanned {} metal bonds and {} putative catalytic triads.",
-                coord_hits,
-                triads.len()
+                "Enzyme audit: {} catalytic motif(s), {} metal/cofactor site(s), {} 3D tunnel(s), {} disulfide proposal(s).",
+                rep.catalytic_motifs.len(),
+                rep.metal_cofactor_sites.len(),
+                rep.tunnels.len(),
+                rep.disulfide_proposals.len()
             ),
         }],
+    };
+    (vis, rep)
+}
+
+/// Run ANM Normal Mode Analysis on `mol`, populate smooth animation frames along `mode_1based`,
+/// and emit 3D porcupine displacement arrows.
+pub fn run_physics_anm_module(
+    mol: &mut Biomolecule,
+    mode_1based: usize,
+    amplitude_a: f64,
+    num_frames: usize,
+) -> Result<(ModuleExecutionOutput, AnmReport), String> {
+    let rep = compute_anm_modes(mol, 13.0, 6)?;
+    let n_frames = generate_anm_trajectory_frames(mol, &rep, mode_1based, amplitude_a, num_frames)?;
+    let lines = anm_mode_porcupine_overlays(mol, &rep, mode_1based, amplitude_a * 2.0);
+    let mut highlights = HashMap::new();
+    for rm in &rep.residue_mobility {
+        if rm.is_hinge {
+            highlights.insert((rm.chain, rm.res_seq), [0.98, 0.80, 0.14]);
+        }
     }
+    let md = render_anm_markdown(&rep);
+    let vis = ModuleExecutionOutput {
+        module_name: "Physics — ANM Normal Modes".to_string(),
+        recommended_repr: Some(RepresentationKind::Cartoon),
+        recommended_color: Some(ColorScheme::Chain),
+        residue_highlights: highlights,
+        sphere_overlays: Vec::new(),
+        line_overlays: lines,
+        summary_markdown: md,
+        provenance: vec![ProvenanceEntry {
+            kind: ProvenanceKind::ComputationalPrediction,
+            source_app: "biomolcraft::biomol-physics (ANM)".to_string(),
+            summary: format!(
+                "ANM {} nodes, mode {} animated across {} frames ({} hinge residues).",
+                rep.guide_nodes,
+                mode_1based,
+                n_frames,
+                rep.hinge_residues.len()
+            ),
+        }],
+    };
+    Ok((vis, rep))
+}
+
+/// Run pure-Rust Still GB/SA solvation, 3D Electrostatic Dipole, and interface `ΔG_bind`.
+#[must_use]
+pub fn run_physics_gbsa_module(mol: &Biomolecule) -> (ModuleExecutionOutput, GbSaReport) {
+    let rep = compute_gbsa_energy(mol, None, None);
+    let mut lines = Vec::new();
+    let d = rep.dipole.dipole_vector_debye;
+    let mag = rep.dipole.dipole_magnitude_debye;
+    if mag > 1.0 {
+        let scale = 14.0 / mag;
+        let c = rep.dipole.center_of_geometry;
+        lines.push(LineOverlay {
+            label: format!("Dipole {mag:.1} D"),
+            from: c,
+            to: [
+                c[0] + d[0] * scale,
+                c[1] + d[1] * scale,
+                c[2] + d[2] * scale,
+            ],
+            dashed: false,
+            rgba: [0.30, 0.86, 0.98, 0.98],
+        });
+    }
+    let md = render_gbsa_markdown(&rep);
+    let vis = ModuleExecutionOutput {
+        module_name: "Physics — GB/SA & Dipole".to_string(),
+        recommended_repr: Some(RepresentationKind::Cartoon),
+        recommended_color: Some(ColorScheme::ElectrostaticEsp),
+        residue_highlights: HashMap::new(),
+        sphere_overlays: Vec::new(),
+        line_overlays: lines,
+        summary_markdown: md,
+        provenance: vec![ProvenanceEntry {
+            kind: ProvenanceKind::ComputationalPrediction,
+            source_app: "biomolcraft::biomol-physics (GB/SA)".to_string(),
+            summary: format!(
+                "GB/SA total {:.2} kcal/mol, Dipole {:.1} D, dG_bind={:?}.",
+                rep.complex_energy.total_kcal,
+                rep.dipole.dipole_magnitude_debye,
+                rep.delta_g_bind_kcal
+            ),
+        }],
+    };
+    (vis, rep)
 }
 
 /// Execute the **ADC & Conjugation-Site 3D Module**: maps solvent-exposed surface Cys/Lys sites

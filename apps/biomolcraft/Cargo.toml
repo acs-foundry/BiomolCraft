@@ -11,8 +11,10 @@ description = "BiomolCraft: Pure-Rust wgpu 3D Biomolecular Visualization, Intera
 workspace = true
 
 [dependencies]
+biomol-enzyme.workspace = true
 biomol-model.workspace = true
 biomol-modules.workspace = true
+biomol-physics.workspace = true
 biomol-rna.workspace = true
 biomol-script.workspace = true
 craftbio-scene.workspace = true

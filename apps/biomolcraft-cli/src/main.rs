@@ -7,10 +7,18 @@ mod mcp;
 
 use std::path::{Path, PathBuf};
 
+use biomol_enzyme::{analyze_enzyme_engineering, render_enzyme_markdown};
 use biomol_model::{
     audit_structure_prep, minimize_local_mm, mutate_and_repack_best_rotamer, mutate_residue_3d,
 };
-use biomol_modules::{run_adc_module, run_antibody_module, run_enzyme_module, run_ncrna_module};
+use biomol_modules::{
+    run_adc_module, run_antibody_module, run_enzyme_engineering_module, run_enzyme_module,
+    run_ncrna_module, run_physics_anm_module, run_physics_gbsa_module,
+};
+use biomol_physics::{
+    OpenMmBiomolConfig, check_openmm_biomol_env, check_xtb_env, compute_gbsa_energy,
+    render_gbsa_markdown, render_rmsd_trace_svg, run_local_langevin_md, run_openmm_biomol_md,
+};
 use biomol_rna::{
     analyze_ncrna_mrna, find_rna_preset, render_rna_arc_svg, render_rna_markdown, rna_presets,
 };
@@ -19,9 +27,11 @@ use clap::{Parser, Subcommand};
 use craftbio_sandbox::{DEFAULT_MAX_FILE_BYTES, PathSandbox};
 use craftbio_scene::{
     CraftSceneDocument, discover_craft_instances, push_scene_via_craft_link,
-    send_dsl_via_craft_link,
+    send_dsl_via_craft_link, send_trajectory_via_craft_link,
 };
-use craftbio_struct::{matchmaker_align, parse_structure_auto, write_pdb};
+use craftbio_struct::{
+    load_dcd_frames, matchmaker_align, parse_structure_auto, write_multi_model_pdb, write_pdb,
+};
 use craftbio_viewport::write_scene_png;
 
 #[derive(Parser)]
@@ -147,12 +157,78 @@ enum Commands {
         #[arg(long)]
         file: Option<PathBuf>,
     },
-    /// Discover running CraftBio/ArtCraft apps via Craft Link v1 (`craft-ipc`) and optionally push a PDB/DSL command.
+    /// Run pure-Rust ANM Normal Mode Analysis, export animated multi-MODEL PDB & optional porcupine PNG.
+    Anm {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        mode: usize,
+        #[arg(long, default_value_t = 2.2)]
+        amp: f64,
+        #[arg(long, default_value_t = 20)]
+        frames: usize,
+        #[arg(long)]
+        out_md: Option<PathBuf>,
+        #[arg(long)]
+        out_traj_pdb: Option<PathBuf>,
+        #[arg(long)]
+        out_png: Option<PathBuf>,
+    },
+    /// Compute pure-Rust Still GB/SA Solvation, 3D Electrostatic Dipole Moment & interface ΔG_bind.
+    Gbsa {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long)]
+        out_md: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run Biomolecular Molecular Dynamics (`--engine rust` instant Langevin or `--engine openmm` live GPU CUDA MD).
+    Md {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long, default_value = "rust", help = "rust | openmm")]
+        engine: String,
+        #[arg(long, default_value_t = 120)]
+        steps: usize,
+        #[arg(long, default_value_t = 10.0)]
+        production_ps: f64,
+        #[arg(
+            long,
+            default_value = "implicit_gbn2",
+            help = "implicit_gbn2 | explicit_tip3p"
+        )]
+        solvent: String,
+        #[arg(long, default_value = "auto", help = "auto | CUDA | OpenCL | CPU")]
+        platform: String,
+        #[arg(long, default_value = "biomol_md_out")]
+        out_dir: PathBuf,
+        #[arg(long)]
+        out_svg: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run full Enzyme & Protein Engineering audit (catalytic triads, metals, 3D substrate tunnels, disulfides).
+    Enzyme {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long)]
+        out_md: Option<PathBuf>,
+        #[arg(long)]
+        out_png: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Probe local Tier-2 GPU Physics engines (OpenMM CUDA/OpenCL/CPU & GFN2-xTB).
+    PhysicsEnv,
+    /// Discover running CraftBio/ArtCraft apps via Craft Link v1 (`craft-ipc`) and optionally push a PDB/DCD/DSL command.
     Link {
         #[arg(long, default_value = "biomolcraft")]
         app: String,
         #[arg(long)]
         push_pdb: Option<PathBuf>,
+        #[arg(long)]
+        push_dcd: Option<PathBuf>,
         #[arg(long)]
         dsl: Option<String>,
     },
@@ -448,7 +524,207 @@ fn run() -> Result<(), String> {
                 println!("{}", sess.execute_dsl(l).map_err(|e| e.to_string())?);
             }
         }
-        Commands::Link { app, push_pdb, dsl } => {
+        Commands::Anm {
+            pdb,
+            mode,
+            amp,
+            frames,
+            out_md,
+            out_traj_pdb,
+            out_png,
+        } => {
+            let mut sess = BiomolSession::default();
+            sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+            let mol = sess.molecule.as_mut().ok_or("no molecule")?;
+            let (vis, _) = run_physics_anm_module(mol, mode, amp, frames)?;
+            if let Some(p) = out_md {
+                write_text(&p, &vis.summary_markdown)?;
+            }
+            if let Some(p) = out_traj_pdb {
+                write_text(&p, &write_multi_model_pdb(mol))?;
+            }
+            sess.render_opts.residue_highlights = vis.residue_highlights;
+            sess.render_opts.line_overlays = vis.line_overlays;
+            sess.dirty_geometry = true;
+            if let Some(p) = out_png {
+                let sc = sess.build_viewport_scene();
+                let bytes = write_scene_png(&sc, &sess.camera, 1600, 1200, false, &p)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "Rendered ANM mode {mode} PNG to {} ({bytes} bytes).",
+                    p.display()
+                );
+            }
+            print!("{}", vis.summary_markdown);
+        }
+        Commands::Gbsa { pdb, out_md, json } => {
+            let raw = std::fs::read_to_string(&pdb).map_err(|e| e.to_string())?;
+            let id = pdb.file_stem().and_then(|s| s.to_str()).unwrap_or("mol");
+            let mol = parse_structure_auto(id, &raw).map_err(|e| e.to_string())?;
+            let rep = compute_gbsa_energy(&mol, None, None);
+            let md = render_gbsa_markdown(&rep);
+            if let Some(p) = out_md {
+                write_text(&p, &md)?;
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rep).map_err(|e| e.to_string())?
+                );
+            } else {
+                print!("{md}");
+            }
+        }
+        Commands::Md {
+            pdb,
+            engine,
+            steps,
+            production_ps,
+            solvent,
+            platform,
+            out_dir,
+            out_svg,
+            json,
+        } => {
+            if engine.eq_ignore_ascii_case("openmm") {
+                let cfg = OpenMmBiomolConfig {
+                    input_pdb: pdb,
+                    out_dir,
+                    solvent_model: solvent,
+                    production_ps,
+                    platform,
+                    ..OpenMmBiomolConfig::default()
+                };
+                let res = run_openmm_biomol_md(&cfg)?;
+                // Verify pure-Rust binary DCD loading right back into craftbio-struct!
+                let topo_raw =
+                    std::fs::read_to_string(&res.topology_pdb_path).map_err(|e| e.to_string())?;
+                let mut mol =
+                    parse_structure_auto("openmm_topo", &topo_raw).map_err(|e| e.to_string())?;
+                let dcd_bytes =
+                    std::fs::read(&res.trajectory_dcd_path).map_err(|e| e.to_string())?;
+                let verified_frames =
+                    load_dcd_frames(&mut mol, &dcd_bytes).map_err(|e| e.to_string())?;
+                if let Some(p) = out_svg {
+                    let svg = render_rmsd_trace_svg(
+                        &format!("OpenMM {} MD Backbone RMSD", res.platform_used),
+                        &res.rmsd_trace_a,
+                    );
+                    write_text(&p, &svg)?;
+                }
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&res).map_err(|e| e.to_string())?
+                    );
+                } else {
+                    println!(
+                        "OpenMM {} ({}) MD complete in {:.2}s: {} atoms, {} frames (DCD verified by pure-Rust loader: {} frames), E_min={:.1} kJ/mol, mean RMSD={:.3} Å, final RMSD={:.3} Å, mean Rg={:.2} Å.",
+                        res.openmm_version,
+                        res.platform_used,
+                        res.elapsed_seconds,
+                        res.atom_count,
+                        res.frames_saved,
+                        verified_frames,
+                        res.minimized_energy_kj,
+                        res.mean_backbone_rmsd_a,
+                        res.final_backbone_rmsd_a,
+                        res.mean_rg_a
+                    );
+                    println!("Topology PDB: {}", res.topology_pdb_path);
+                    println!("Trajectory DCD: {}", res.trajectory_dcd_path);
+                }
+            } else {
+                let raw = std::fs::read_to_string(&pdb).map_err(|e| e.to_string())?;
+                let id = pdb.file_stem().and_then(|s| s.to_str()).unwrap_or("mol");
+                let mut mol = parse_structure_auto(id, &raw).map_err(|e| e.to_string())?;
+                let rep = run_local_langevin_md(&mut mol, &[], steps, 6, 300.0, 1.5, 2026)?;
+                std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+                let traj_path = out_dir.join(format!("{id}_rust_md.pdb"));
+                write_text(&traj_path, &write_multi_model_pdb(&mol))?;
+                if let Some(p) = out_svg {
+                    let vals: Vec<f64> = rep.trace.iter().map(|t| t.rmsd_a).collect();
+                    write_text(
+                        &p,
+                        &render_rmsd_trace_svg("Pure-Rust Local Langevin MD RMSD", &vals),
+                    )?;
+                }
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&rep).map_err(|e| e.to_string())?
+                    );
+                } else {
+                    println!(
+                        "Pure-Rust Langevin MD ({} mobile atoms, {} steps -> {} frames): final RMSD {:.3} Å, mean E {:.1} kcal/mol -> {}",
+                        rep.mobile_atoms,
+                        rep.total_steps,
+                        rep.frames_recorded,
+                        rep.final_rmsd_a,
+                        rep.mean_potential_kcal,
+                        traj_path.display()
+                    );
+                }
+            }
+        }
+        Commands::Enzyme {
+            pdb,
+            out_md,
+            out_png,
+            json,
+        } => {
+            let mut sess = BiomolSession::default();
+            sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+            let mol = sess.molecule.as_ref().ok_or("no molecule")?;
+            let (vis, rep) = run_enzyme_engineering_module(mol);
+            if let Some(p) = out_md {
+                write_text(&p, &vis.summary_markdown)?;
+            }
+            if let Some(p) = out_png {
+                sess.render_opts.residue_highlights = vis.residue_highlights;
+                sess.render_opts.sphere_overlays = vis.sphere_overlays;
+                sess.render_opts.line_overlays = vis.line_overlays;
+                sess.dirty_geometry = true;
+                let sc = sess.build_viewport_scene();
+                let bytes = write_scene_png(&sc, &sess.camera, 1600, 1200, false, &p)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "Rendered Enzyme/Tunnels PNG to {} ({bytes} bytes).",
+                    p.display()
+                );
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rep).map_err(|e| e.to_string())?
+                );
+            } else {
+                let _ = (
+                    analyze_enzyme_engineering,
+                    render_enzyme_markdown,
+                    run_physics_gbsa_module,
+                );
+                print!("{}", vis.summary_markdown);
+            }
+        }
+        Commands::PhysicsEnv => {
+            let omm = check_openmm_biomol_env();
+            let xtb = check_xtb_env();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "openmm": omm,
+                    "gfn2_xtb_available": xtb
+                }))
+                .map_err(|e| e.to_string())?
+            );
+        }
+        Commands::Link {
+            app,
+            push_pdb,
+            push_dcd,
+            dsl,
+        } => {
             let instances =
                 discover_craft_instances(None, Some(&app)).map_err(|e| e.to_string())?;
             if instances.is_empty() {
@@ -459,7 +735,16 @@ fn run() -> Result<(), String> {
                 "Found {} live Craft Link instance(s) of '{app}'.",
                 instances.len()
             );
-            if let Some(p) = push_pdb {
+            if let (Some(p), Some(d)) = (&push_pdb, &push_dcd) {
+                let rep = send_trajectory_via_craft_link(
+                    &instances[0],
+                    "biomolcraft-cli",
+                    &p.display().to_string(),
+                    &d.display().to_string(),
+                )
+                .map_err(|e| e.to_string())?;
+                println!("Pushed trajectory via Craft Link: {rep}");
+            } else if let Some(p) = push_pdb {
                 let doc = CraftSceneDocument {
                     title: p
                         .file_stem()

@@ -11,8 +11,10 @@ description = "Headless CLI, Craft Link v1 client, and storytold/craft-mcp-serve
 workspace = true
 
 [dependencies]
+biomol-enzyme.workspace = true
 biomol-model.workspace = true
 biomol-modules.workspace = true
+biomol-physics.workspace = true
 biomol-rna.workspace = true
 biomol-script.workspace = true
 clap.workspace = true

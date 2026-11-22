@@ -9,13 +9,18 @@ use std::path::Path;
 use biomol_model::{
     audit_structure_prep, minimize_local_mm, mutate_and_repack_best_rotamer, mutate_residue_3d,
 };
-use biomol_modules::{run_adc_module, run_antibody_module, run_enzyme_module, run_ncrna_module};
+use biomol_modules::{
+    run_adc_module, run_antibody_module, run_enzyme_module, run_ncrna_module,
+    run_physics_anm_module, run_physics_gbsa_module,
+};
+use biomol_physics::run_local_langevin_md;
 use biomol_rna::{analyze_ncrna_mrna, find_rna_preset, render_rna_markdown};
 use craftbio_scene::{
     ColorScheme, CraftSceneDocument, ProvenanceEntry, ProvenanceKind, RepresentationKind,
 };
 use craftbio_struct::{
-    Biomolecule, evaluate_selection, matchmaker_align, parse_structure_auto, write_pdb,
+    Biomolecule, evaluate_selection, load_dcd_frames, matchmaker_align, parse_structure_auto,
+    write_mmcif, write_multi_model_pdb, write_pdb,
 };
 use craftbio_viewport::{
     Camera3D, RenderOptions, RenderSceneData, build_render_scene, write_scene_png,
@@ -476,15 +481,133 @@ impl BiomolSession {
                         .map_err(|e| ScriptError::Command(e.to_string()))?;
                     std::fs::write(out, text)?;
                     Ok(format!("Saved CraftScene JSON to {}.", out.display()))
+                } else if rest.ends_with(".cif") || rest.ends_with(".mmcif") {
+                    let mol = self
+                        .molecule
+                        .as_ref()
+                        .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                    std::fs::write(out, write_mmcif(mol))?;
+                    Ok(format!("Saved mmCIF to {}.", out.display()))
                 } else {
                     let mol = self
                         .molecule
                         .as_ref()
                         .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
-                    std::fs::write(out, write_pdb(mol))?;
+                    let txt = if mol.frames.len() > 1 {
+                        write_multi_model_pdb(mol)
+                    } else {
+                        write_pdb(mol)
+                    };
+                    std::fs::write(out, txt)?;
                     Ok(format!("Saved PDB to {}.", out.display()))
                 }
             }
+            "anm" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                let mode: usize = toks.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+                let amp: f64 = toks.get(1).and_then(|s| s.parse().ok()).unwrap_or(2.2);
+                let mol = self
+                    .molecule
+                    .as_mut()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let (vis, rep) = run_physics_anm_module(mol, mode, amp, 20)
+                    .map_err(ScriptError::Command)?;
+                self.render_opts.residue_highlights = vis.residue_highlights;
+                self.render_opts.line_overlays = vis.line_overlays;
+                self.last_module_markdown = vis.summary_markdown;
+                self.provenance.extend(vis.provenance);
+                self.dirty_geometry = true;
+                Ok(format!(
+                    "ANM mode {} animated across {} frames ({} nodes, {} hinges).",
+                    mode,
+                    mol.frames.len(),
+                    rep.guide_nodes,
+                    rep.hinge_residues.len()
+                ))
+            }
+            "gbsa" | "dipole" => {
+                let mol = self
+                    .molecule
+                    .as_ref()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let (vis, rep) = run_physics_gbsa_module(mol);
+                self.render_opts.color_scheme = ColorScheme::ElectrostaticEsp;
+                self.render_opts.line_overlays = vis.line_overlays;
+                self.last_module_markdown = vis.summary_markdown;
+                self.provenance.extend(vis.provenance);
+                self.dirty_geometry = true;
+                Ok(format!(
+                    "GB/SA total {:.2} kcal/mol | Dipole {:.1} D | dG_bind={:?}.",
+                    rep.complex_energy.total_kcal,
+                    rep.dipole.dipole_magnitude_debye,
+                    rep.delta_g_bind_kcal
+                ))
+            }
+            "md" => {
+                let steps: usize = rest.parse().unwrap_or(120);
+                self.push_undo_snapshot();
+                let mask = self.render_opts.selected_atoms.clone();
+                let mol = self
+                    .molecule
+                    .as_mut()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let rep = run_local_langevin_md(mol, &mask, steps, 6, 300.0, 1.5, 2026)
+                    .map_err(ScriptError::Command)?;
+                self.dirty_geometry = true;
+                let msg = format!(
+                    "Pure-Rust Langevin MD ({} mobile atoms, {} steps -> {} frames): final RMSD {:.3} Å, mean E {:.1} kcal/mol.",
+                    rep.mobile_atoms,
+                    rep.total_steps,
+                    rep.frames_recorded,
+                    rep.final_rmsd_a,
+                    rep.mean_potential_kcal
+                );
+                self.provenance.push(ProvenanceEntry {
+                    kind: ProvenanceKind::MolecularDynamics,
+                    source_app: "biomolcraft::biomol-physics (Langevin-Rust)".to_string(),
+                    summary: msg.clone(),
+                });
+                Ok(msg)
+            }
+            "frame" => {
+                let idx: usize = rest
+                    .parse()
+                    .map_err(|_| ScriptError::Command("usage: frame <0-based index>".to_string()))?;
+                let mol = self
+                    .molecule
+                    .as_mut()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                if mol.set_active_frame(idx) {
+                    self.dirty_geometry = true;
+                    Ok(format!("Switched to trajectory frame {}/{}.", idx + 1, mol.frames.len()))
+                } else {
+                    Err(ScriptError::Command(format!(
+                        "frame {idx} out of range (loaded frames: {})",
+                        mol.frames.len()
+                    )))
+                }
+            }
+            "load_dcd" => {
+                if rest.is_empty() {
+                    return Err(ScriptError::Command("usage: load_dcd <trajectory.dcd>".to_string()));
+                }
+                let bytes = std::fs::read(rest)?;
+                let mol = self
+                    .molecule
+                    .as_mut()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let loaded = load_dcd_frames(mol, &bytes)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                self.dirty_geometry = true;
+                let msg = format!("Loaded {loaded} binary DCD trajectory frames from {rest}.");
+                self.provenance.push(ProvenanceEntry {
+                    kind: ProvenanceKind::MolecularDynamics,
+                    source_app: "biomolcraft::dcd-loader".to_string(),
+                    summary: msg.clone(),
+                });
+                Ok(msg)
+            }
+            "tunnels" => self.execute_single_cmd("module enzymes"),
             "undo" => {
                 if let Some(prev) = self.undo_stack.pop() {
                     if let Some(cur) = self.molecule.replace(prev) {

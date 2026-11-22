@@ -6,11 +6,13 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use biomol_modules::{
     ModuleId, run_adc_module, run_antibody_module, run_enzyme_module, run_ncrna_module,
     run_pk_tmdd_module,
 };
+use biomol_physics::{OpenMmEnvStatus, check_openmm_biomol_env};
 use biomol_rna::{NcRnaAnalysisReport, analyze_ncrna_mrna, find_rna_preset, rna_presets};
 use biomol_script::BiomolSession;
 use craftbio_scene::{ColorScheme, CraftBioLinkServer, InboundLinkCommand, RepresentationKind};
@@ -21,6 +23,7 @@ use eframe::egui;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RightModuleTab {
     Modeling,
+    Physics,
     Antibodies,
     NcRnaMrna,
     Enzymes,
@@ -41,6 +44,16 @@ pub struct BiomolCraftApp {
     console_log: Vec<String>,
     picked_atom_info: String,
     status_line: String,
+
+    // Trajectory playback state
+    playing_trajectory: bool,
+    traj_fps: f32,
+    last_frame_tick: Instant,
+
+    // Physics module state
+    anm_mode_sel: usize,
+    anm_amp_a: f64,
+    openmm_status: OpenMmEnvStatus,
 
     // Mutagenesis wizard state
     mut_chain: String,
@@ -79,11 +92,17 @@ impl Default for BiomolCraftApp {
                 .to_string(),
             console_input: String::new(),
             console_log: vec![
-                "BiomolCraft v0.1.0 — Pure-Rust wgpu 3D Biomolecular Studio. Type 'help' for PyMOL/ChimeraX-style DSL.".to_string(),
+                "BiomolCraft v0.2.0 — Pure-Rust wgpu 3D Biomolecular Studio + Hybrid GPU Physics. Type 'help' for DSL.".to_string(),
                 link_status.to_string(),
             ],
             picked_atom_info: "Click any atom/residue in 3D or sequence strip to inspect".to_string(),
             status_line: link_status.to_string(),
+            playing_trajectory: false,
+            traj_fps: 12.0,
+            last_frame_tick: Instant::now(),
+            anm_mode_sel: 1,
+            anm_amp_a: 2.2,
+            openmm_status: check_openmm_biomol_env(),
             mut_chain: "B".to_string(),
             mut_res_seq: 105,
             mut_target_aa: 'A',
@@ -153,15 +172,35 @@ impl BiomolCraftApp {
             .unwrap_or_default();
         for cmd in cmds {
             match cmd {
-                InboundLinkCommand::OpenPdb { path, source_app } => {
+                InboundLinkCommand::OpenPdb {
+                    path,
+                    source_app,
+                    module_hint,
+                } => {
                     self.open_path_input = path.clone();
                     match self.session.load_structure_file(&PathBuf::from(&path)) {
                         Ok(msg) => {
                             self.console_log
                                 .push(format!("[Craft Link ← {source_app}] {msg}"));
                             self.status_line = msg;
+                            if let Some(m) = module_hint {
+                                self.run_dsl(&format!("module {m}"));
+                            }
                         }
                         Err(e) => self.console_log.push(format!("[Craft Link ERROR] {e}")),
+                    }
+                }
+                InboundLinkCommand::LoadTrajectory {
+                    pdb_path,
+                    dcd_path,
+                    source_app,
+                } => {
+                    self.open_path_input = pdb_path.clone();
+                    if let Ok(msg) = self.session.load_structure_file(&PathBuf::from(&pdb_path)) {
+                        self.console_log
+                            .push(format!("[Craft Link ← {source_app}] {msg}"));
+                        self.run_dsl(&format!("load_dcd {dcd_path}"));
+                        self.playing_trajectory = true;
                     }
                 }
                 InboundLinkCommand::LoadScene(doc) => {
@@ -206,6 +245,25 @@ impl BiomolCraftApp {
 impl eframe::App for BiomolCraftApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_craft_link_inbox();
+        // Smooth trajectory animation playback for ANM modes, Rust MD, and OpenMM DCD trajectories
+        if self.playing_trajectory {
+            let interval =
+                Duration::from_secs_f32((1.0 / self.traj_fps.clamp(1.0, 60.0)).max(0.016));
+            if self.last_frame_tick.elapsed() >= interval {
+                if let Some(ref mut mol) = self.session.molecule
+                    && mol.frames.len() > 1
+                {
+                    let next = (mol.active_frame + 1) % mol.frames.len();
+                    mol.set_active_frame(next);
+                    self.session.dirty_geometry = true;
+                    self.last_frame_tick = Instant::now();
+                } else {
+                    self.playing_trajectory = false;
+                }
+                self.sync_viewport_scene();
+            }
+            ctx.request_repaint_after(interval);
+        }
         ctx.set_visuals(if self.dark_mode {
             egui::Visuals::dark()
         } else {
@@ -338,13 +396,27 @@ impl eframe::App for BiomolCraftApp {
             .resizable(true)
             .default_height(155.0)
             .show(ctx, |ui| {
-                // Sequence strip synced with 3D
+                // Sequence strip & interactive trajectory timeline synced with 3D
                 let mut click_target: Option<(char, i32, char)> = None;
+                let mut requested_frame: Option<usize> = None;
                 if let Some(ref mol) = self.session.molecule {
                     ui.horizontal(|ui| {
                         ui.strong("Sequence Strip:");
                         if mol.frames.len() > 1 {
-                            ui.label(format!("Frame {}/{}:", mol.active_frame + 1, mol.frames.len()));
+                            let play_lbl = if self.playing_trajectory { "⏸ Pause" } else { "▶ Play" };
+                            if ui.small_button(play_lbl).clicked() {
+                                self.playing_trajectory = !self.playing_trajectory;
+                                self.last_frame_tick = Instant::now();
+                            }
+                            let mut cur = mol.active_frame;
+                            let max_f = mol.frames.len().saturating_sub(1);
+                            if ui
+                                .add(egui::Slider::new(&mut cur, 0..=max_f).text("Frame"))
+                                .changed()
+                            {
+                                requested_frame = Some(cur);
+                            }
+                            ui.label(format!("({}/{})", cur + 1, mol.frames.len()));
                         }
                         ui.small(&self.picked_atom_info);
                     });
@@ -376,6 +448,13 @@ impl eframe::App for BiomolCraftApp {
                             }
                         });
                     });
+                }
+                if let Some(f_idx) = requested_frame
+                    && let Some(ref mut mol) = self.session.molecule
+                {
+                    mol.set_active_frame(f_idx);
+                    self.session.dirty_geometry = true;
+                    self.sync_viewport_scene();
                 }
                 if let Some((c, rseq, code)) = click_target {
                     self.mut_chain = c.to_string();
@@ -518,6 +597,7 @@ impl eframe::App for BiomolCraftApp {
                 ui.horizontal_wrapped(|ui| {
                     for (t, lbl) in [
                         (RightModuleTab::Modeling, "Model 3D"),
+                        (RightModuleTab::Physics, "Physics"),
                         (RightModuleTab::Antibodies, "Ab / VHH"),
                         (RightModuleTab::NcRnaMrna, "ncRNA/mRNA"),
                         (RightModuleTab::Enzymes, "Enzymes"),
@@ -530,6 +610,7 @@ impl eframe::App for BiomolCraftApp {
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| match self.right_tab {
                     RightModuleTab::Modeling => self.ui_modeling_module(ui),
+                    RightModuleTab::Physics => self.ui_physics_module(ui),
                     RightModuleTab::Antibodies => self.ui_antibody_module(ui),
                     RightModuleTab::NcRnaMrna => self.ui_ncrna_module(ui),
                     RightModuleTab::Enzymes => self.ui_enzyme_module(ui),
@@ -619,6 +700,58 @@ impl BiomolCraftApp {
                 self.run_dsl("redo");
             }
         });
+    }
+
+    fn ui_physics_module(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Hybrid Biomolecular Physics (ANM · GB/SA · MD)");
+        ui.horizontal(|ui| {
+            ui.label("ANM Mode:");
+            ui.add(egui::DragValue::new(&mut self.anm_mode_sel).range(1..=6));
+            ui.label("Amp (Å):");
+            ui.add(
+                egui::DragValue::new(&mut self.anm_amp_a)
+                    .range(0.5..=6.0)
+                    .speed(0.2),
+            );
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Compute & Animate ANM Mode").clicked() {
+                let cmd = format!("anm {} {:.1}", self.anm_mode_sel, self.anm_amp_a);
+                self.run_dsl(&cmd);
+                self.playing_trajectory = true;
+            }
+            if ui.button("GB/SA + Dipole + ΔG_bind").clicked() {
+                self.run_dsl("gbsa");
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Run Pure-Rust Langevin MD (120 steps)").clicked() {
+                self.run_dsl("md 120");
+                self.playing_trajectory = true;
+            }
+        });
+        ui.separator();
+        ui.strong(format!(
+            "Tier-2 OpenMM GPU Runtime: {} ({})",
+            if self.openmm_status.available {
+                self.openmm_status
+                    .openmm_version
+                    .as_deref()
+                    .unwrap_or("Detected")
+            } else {
+                "Not Installed"
+            },
+            if self.openmm_status.cuda_ready {
+                "CUDA RTX Ready"
+            } else {
+                "CPU Fallback"
+            }
+        ));
+        ui.small(
+            "Run full explicit/GBn2 GPU MD via `biomolcraft-cli md --engine openmm --pdb <file> --platform CUDA` and load the `.dcd` via `load_dcd` or Craft Link.",
+        );
+        ui.separator();
+        ui.monospace(&self.session.last_module_markdown);
     }
 
     fn ui_antibody_module(&mut self, ui: &mut egui::Ui) {

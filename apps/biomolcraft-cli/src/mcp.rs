@@ -11,7 +11,7 @@ use craft_mcp_server::{
     Effect, Info, Options, Server, Tools, image_result, object, string, text_result, tool,
 };
 use craftbio_sandbox::PathSandbox;
-use craftbio_struct::write_pdb;
+use craftbio_struct::{write_mmcif, write_pdb};
 use craftbio_viewport::render_scene_png_bytes;
 use serde_json::{Value, json};
 
@@ -124,12 +124,39 @@ impl Tools for BiomolTools {
             tool(
                 "save_structure_or_scene",
                 "Save PDB or CraftScene",
-                "Write the current (possibly mutated/minimized) structure as .pdb or .craftscene.json inside the sandbox write root.",
+                "Write the current (possibly mutated/minimized) structure as .pdb, .cif, or .craftscene.json inside the sandbox write root.",
                 object(
-                    json!({ "out_path": string("Output filename inside sandbox write root (.pdb or .craftscene.json)") }),
+                    json!({ "out_path": string("Output filename inside sandbox write root (.pdb, .cif, or .craftscene.json)") }),
                     &["out_path"],
                 ),
                 Effect::Files,
+            ),
+            tool(
+                "run_anm_modes",
+                "ANM Normal Mode Analysis",
+                "Compute the 6 lowest collective Anisotropic Network Model (ANM) normal modes, hinge residues, and generate animated 3D trajectory frames.",
+                object(
+                    json!({
+                        "mode": { "type": "integer", "description": "Mode index 1..6 (default 1)" },
+                        "amplitude_a": { "type": "number", "description": "Max displacement amplitude in Angstroms (default 2.2)" }
+                    }),
+                    &[],
+                ),
+                Effect::Edits,
+            ),
+            tool(
+                "run_gbsa_physics",
+                "GB/SA Solvation & Dipole",
+                "Compute pure-Rust Still GB/SA implicit solvation energy, 3D electrostatic dipole moment (Debye), and single-trajectory interface ΔG_bind.",
+                object(json!({}), &[]),
+                Effect::ReadOnly,
+            ),
+            tool(
+                "run_enzyme_engineering",
+                "Enzyme Triads, Tunnels & Disulfides",
+                "Detect catalytic triads/dyads, metal/cofactor coordination spheres, 3D substrate access tunnels, and thermostabilizing disulfide bridge proposals.",
+                object(json!({}), &[]),
+                Effect::ReadOnly,
             ),
         ]
     }
@@ -270,7 +297,11 @@ impl Tools for BiomolTools {
                         Err(e) => return text_result(e.to_string(), true),
                     }
                 } else if let Some(ref mol) = self.session.molecule {
-                    write_pdb(mol)
+                    if out.ends_with(".cif") || out.ends_with(".mmcif") {
+                        write_mmcif(mol)
+                    } else {
+                        write_pdb(mol)
+                    }
                 } else {
                     return text_result("no biomolecule loaded to save", true);
                 };
@@ -279,6 +310,34 @@ impl Tools for BiomolTools {
                     Err(e) => text_result(format!("sandbox write rejected: {e}"), true),
                 }
             }
+            "run_anm_modes" => {
+                let m = args.get("mode").and_then(Value::as_u64).unwrap_or(1);
+                let amp = args
+                    .get("amplitude_a")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(2.2);
+                match self.session.execute_dsl(&format!("anm {m} {amp:.2}")) {
+                    Ok(msg) => text_result(
+                        format!("{msg}\n\n{}", self.session.last_module_markdown),
+                        false,
+                    ),
+                    Err(e) => text_result(e.to_string(), true),
+                }
+            }
+            "run_gbsa_physics" => match self.session.execute_dsl("gbsa") {
+                Ok(msg) => text_result(
+                    format!("{msg}\n\n{}", self.session.last_module_markdown),
+                    false,
+                ),
+                Err(e) => text_result(e.to_string(), true),
+            },
+            "run_enzyme_engineering" => match self.session.execute_dsl("tunnels") {
+                Ok(msg) => text_result(
+                    format!("{msg}\n\n{}", self.session.last_module_markdown),
+                    false,
+                ),
+                Err(e) => text_result(e.to_string(), true),
+            },
             other => text_result(format!("unknown tool '{other}'"), true),
         }
     }
@@ -343,7 +402,7 @@ mod tests {
             .pointer("/result/tools")
             .and_then(Value::as_array)
             .ok_or("no tools")?;
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 11);
 
         let rna = srv
             .handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fold_ncrna_mrna","arguments":{"preset":"guanine_riboswitch"}}}"#)

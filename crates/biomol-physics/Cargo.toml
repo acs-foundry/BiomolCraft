@@ -1,0 +1,20 @@
+[package]
+name = "biomol-physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Hybrid Biomolecular Physics Engine for BiomolCraft: Pure-Rust ANM/GNM Normal Modes, GB/SA Solvation & Dipole, Local Langevin MD, and Live OpenMM CUDA GPU + xTB Bridges"
+
+[lints]
+workspace = true
+
+[dependencies]
+craftbio-report.workspace = true
+craftbio-scene.workspace = true
+craftbio-struct.workspace = true
+rayon = "1.10"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

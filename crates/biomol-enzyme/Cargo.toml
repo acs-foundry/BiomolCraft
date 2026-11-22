@@ -1,0 +1,16 @@
+[package]
+name = "biomol-enzyme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Enzymes & Protein Engineering Module for BiomolCraft: Catalytic Triads/Dyads, Metal/Cofactor Coordination, 3D Substrate Access Tunnels, Stabilizing Disulfides, and Fold ΔΔG"
+
+[lints]
+workspace = true
+
+[dependencies]
+craftbio-scene.workspace = true
+craftbio-struct.workspace = true
+serde.workspace = true
