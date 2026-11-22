@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! `biomolcraft` — Flagship Pure-Rust `wgpu 24 + egui` Biomolecular 3D Studio, Interactive
-//! Modeling Workbench & Modular Design Suite (Schrödinger Maestro / BioLuminate / ChimeraX /
-//! PyMOL replacement aligned with `storytold/craft-libs` Craft Link v1).
+//! `biomolcraft` — Flagship Pure-Rust `wgpu 24 + egui` Multi-Model Biomolecular 3D Studio,
+//! Interactive Modeling Workbench, Native **`ViewDockX`** (`DockCraft` Craft Link v1), and
+//! Modular Biologics/ncRNA/Enzyme Design Suite (`v0.4.0`).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -14,17 +14,18 @@ use biomol_modules::{
 };
 use biomol_physics::{OpenMmEnvStatus, check_openmm_biomol_env};
 use biomol_rna::{NcRnaAnalysisReport, analyze_ncrna_mrna, find_rna_preset, rna_presets};
-use biomol_script::BiomolSession;
+use biomol_script::{BiomolSession, PoseStatusTag};
 use craftbio_scene::{
-    ColorScheme, CraftBioLinkServer, InboundLinkCommand, RepresentationKind,
-    discover_craft_instances,
+    ColorScheme, CraftBioLinkServer, DockCraftSceneBundle, GridBox3D, InboundLinkCommand,
+    LightingPreset, RepresentationKind, discover_craft_instances,
 };
-use craftbio_struct::ResidueClass;
+use craftbio_struct::{ResidueClass, write_pdb};
 use craftbio_viewport::{SharedViewportScene, show_biomol_viewport};
 use eframe::egui;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RightModuleTab {
+    ViewDockX,
     Modeling,
     Physics,
     CryoEm,
@@ -37,6 +38,27 @@ enum RightModuleTab {
     Evidence,
 }
 
+#[derive(Debug, Clone, Default)]
+struct StartupArgs {
+    open_file: Option<PathBuf>,
+    dock_bundle: Option<PathBuf>,
+}
+
+fn parse_startup_args() -> StartupArgs {
+    let mut out = StartupArgs::default();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--dock-bundle" {
+            if let Some(p) = args.next() {
+                out.dock_bundle = Some(PathBuf::from(p));
+            }
+        } else if !arg.starts_with('-') && out.open_file.is_none() {
+            out.open_file = Some(PathBuf::from(arg));
+        }
+    }
+    out
+}
+
 pub struct BiomolCraftApp {
     dark_mode: bool,
     session: BiomolSession,
@@ -46,6 +68,7 @@ pub struct BiomolCraftApp {
     // UI state
     right_tab: RightModuleTab,
     open_path_input: String,
+    fetch_id_input: String,
     console_input: String,
     console_log: Vec<String>,
     picked_atom_info: String,
@@ -66,6 +89,9 @@ pub struct BiomolCraftApp {
     denovo_hotspots: String,
     live_peers_summary: String,
 
+    // ViewDockX ligand path for "Dock Here in DockCraft"
+    dock_ligand_input: String,
+
     // Mutagenesis wizard state
     mut_chain: String,
     mut_res_seq: i32,
@@ -85,10 +111,16 @@ pub struct BiomolCraftApp {
 
 impl Default for BiomolCraftApp {
     fn default() -> Self {
+        Self::with_startup(StartupArgs::default())
+    }
+}
+
+impl BiomolCraftApp {
+    fn with_startup(startup: StartupArgs) -> Self {
         let link_server =
             CraftBioLinkServer::start("biomolcraft", env!("CARGO_PKG_VERSION"), None).ok();
         let link_status = if link_server.is_some() {
-            "Craft Link v1 socket active (ready for DockCraft/ChemCraft/AdmetCraft/ArtCraft)."
+            "Craft Link v1 socket active (bidirectional DockCraft/ChemCraft/AdmetCraft/ArtCraft)."
         } else {
             "Local standalone session."
         };
@@ -101,9 +133,10 @@ impl Default for BiomolCraftApp {
             right_tab: RightModuleTab::Antibodies,
             open_path_input: "/home/acs/Datos/CraftBio/campaigns/biologics_pilot/1N8Z.pdb"
                 .to_string(),
+            fetch_id_input: "1CRN".to_string(),
             console_input: String::new(),
             console_log: vec![
-                "BiomolCraft v0.2.0 — Pure-Rust wgpu 3D Biomolecular Studio + Hybrid GPU Physics. Type 'help' for DSL.".to_string(),
+                "BiomolCraft v0.4.0 — Multi-Model wgpu Depth32F+SSAO Studio · Cartoon/SES Meshes · ViewDockX. Type 'help'.".to_string(),
                 link_status.to_string(),
             ],
             picked_atom_info: "Click any atom/residue in 3D or sequence strip to inspect".to_string(),
@@ -119,6 +152,7 @@ impl Default for BiomolCraftApp {
             denovo_chain: "C".to_string(),
             denovo_hotspots: "C558 C560 C573".to_string(),
             live_peers_summary: "Click 'Scan Craft Link v1 Peers' to detect live CraftBio & ArtCraft apps.".to_string(),
+            dock_ligand_input: String::new(),
             mut_chain: "B".to_string(),
             mut_res_seq: 105,
             mut_target_aa: 'A',
@@ -132,13 +166,29 @@ impl Default for BiomolCraftApp {
             adc_dar: 8.0,
         };
 
-        // Load pilot 1N8Z structure automatically if present on disk
-        let default_pdb = PathBuf::from(&app.open_path_input);
-        if default_pdb.is_file()
-            && let Ok(msg) = app.session.load_structure_file(&default_pdb)
-        {
-            app.console_log.push(msg.clone());
-            app.status_line = msg;
+        if let Some(bundle_path) = startup.dock_bundle {
+            if let Ok(raw) = std::fs::read_to_string(&bundle_path)
+                && let Ok(bundle) = serde_json::from_str::<DockCraftSceneBundle>(&raw)
+                && let Ok(msg) = app.session.load_dockcraft_bundle(bundle)
+            {
+                app.right_tab = RightModuleTab::ViewDockX;
+                app.console_log.push(msg.clone());
+                app.status_line = msg;
+            }
+        } else if let Some(open_p) = startup.open_file {
+            app.open_path_input = open_p.display().to_string();
+            if let Ok(msg) = app.session.load_structure_file(&open_p) {
+                app.console_log.push(msg.clone());
+                app.status_line = msg;
+            }
+        } else {
+            let default_pdb = PathBuf::from(&app.open_path_input);
+            if default_pdb.is_file()
+                && let Ok(msg) = app.session.load_structure_file(&default_pdb)
+            {
+                app.console_log.push(msg.clone());
+                app.status_line = msg;
+            }
         }
         if let Ok(r) = analyze_ncrna_mrna(&app.rna_name, "ncRNA — Riboswitch", &app.rna_seq, None)
         {
@@ -147,14 +197,17 @@ impl Default for BiomolCraftApp {
         app.sync_viewport_scene();
         app
     }
-}
 
-impl BiomolCraftApp {
     fn sync_viewport_scene(&mut self) {
         if self.session.dirty_geometry {
+            self.session.sync_active_render_opts();
             let data = self.session.build_viewport_scene();
             self.viewport_scene.update(data);
             self.session.dirty_geometry = false;
+        }
+        // Always keep synchronous `biomol.get_selection_box` snapshot fresh for DockCraft!
+        if let Some(ref srv) = self.link_server {
+            srv.set_selection_box(self.session.current_selection_box_snapshot(5.0));
         }
     }
 
@@ -231,11 +284,26 @@ impl BiomolCraftApp {
                     self.session.render_opts.color_scheme = doc.color_scheme;
                     self.session.render_opts.sphere_overlays = doc.sphere_overlays;
                     self.session.render_opts.line_overlays = doc.line_overlays;
+                    self.session.sync_active_render_opts();
                     self.session.dirty_geometry = true;
                     self.console_log.push(format!(
                         "[Craft Link ← {}] Loaded scene '{}'",
                         doc.source_app, doc.title
                     ));
+                }
+                InboundLinkCommand::LoadDockCraftBundle(bundle) => {
+                    let src = bundle.source_app.clone();
+                    match self.session.load_dockcraft_bundle(*bundle) {
+                        Ok(msg) => {
+                            self.right_tab = RightModuleTab::ViewDockX;
+                            self.console_log.push(format!("[Craft Link ← {src}] {msg}"));
+                            self.status_line = msg;
+                        }
+                        Err(e) => {
+                            self.console_log
+                                .push(format!("[Craft Link ← {src} ERROR] {e}"));
+                        }
+                    }
                 }
                 InboundLinkCommand::RunDsl {
                     command,
@@ -256,17 +324,135 @@ impl BiomolCraftApp {
             Err(e) => self.status_line = format!("Could not launch {bin}: {e}"),
         }
     }
+
+    fn dock_here_in_dockcraft(&mut self) {
+        let Some(mol) = self.session.active_molecule().cloned() else {
+            self.status_line = "Load a receptor structure first.".to_string();
+            return;
+        };
+        let Some(snap) = self.session.current_selection_box_snapshot(5.0) else {
+            self.status_line =
+                "Select binding-site residues or set a GridBox in ViewDockX first.".to_string();
+            return;
+        };
+        let tmp_dir = std::env::temp_dir().join("biomolcraft_dock_handoff");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let rec_path = tmp_dir.join("receptor.pdb");
+        if let Err(e) = std::fs::write(&rec_path, write_pdb(&mol)) {
+            self.status_line = format!("Failed to write temp receptor: {e}");
+            return;
+        }
+        let lig_path_str = self.dock_ligand_input.trim().to_string();
+        if lig_path_str.is_empty() {
+            // Launch DockCraft GUI preloaded with receptor so user can pick library/ligand interactively
+            match Command::new("dockcraft").arg(&rec_path).spawn() {
+                Ok(_) => {
+                    self.status_line =
+                        "Launched DockCraft GUI with active receptor — click 'Box ← BiomolCraft' to sync GridBox!"
+                            .to_string();
+                }
+                Err(e) => self.status_line = format!("Could not launch dockcraft: {e}"),
+            }
+            return;
+        }
+        let out_bundle = tmp_dir.join("viewdock_result.dockbundle.json");
+        let out_sdf = tmp_dir.join("docked_poses.sdf");
+        let gb = snap.grid_box;
+        let center_s = format!(
+            "{:.3},{:.3},{:.3}",
+            gb.center[0], gb.center[1], gb.center[2]
+        );
+        let size_s = format!("{:.2},{:.2},{:.2}", gb.size[0], gb.size[1], gb.size[2]);
+        let res = Command::new("dockcraft-cli")
+            .args([
+                "dock",
+                "--receptor",
+                &rec_path.display().to_string(),
+                "--ligand",
+                &lig_path_str,
+                "--center",
+                &center_s,
+                "--size",
+                &size_s,
+                "--rerank-hyde",
+                "--out-sdf",
+                &out_sdf.display().to_string(),
+                "--out-dock-bundle",
+                &out_bundle.display().to_string(),
+            ])
+            .output();
+        match res {
+            Ok(out) if out.status.success() && out_bundle.is_file() => {
+                self.run_dsl(&format!("load_dock {}", out_bundle.display()));
+                self.right_tab = RightModuleTab::ViewDockX;
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                self.status_line = format!("dockcraft-cli dock failed: {err}");
+                self.console_log.push(self.status_line.clone());
+            }
+            Err(e) => self.status_line = format!("Could not invoke dockcraft-cli: {e}"),
+        }
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        let shift = ctx.input(|i| i.modifiers.shift);
+        let fkeys = [
+            (egui::Key::F1, "f1"),
+            (egui::Key::F2, "f2"),
+            (egui::Key::F3, "f3"),
+            (egui::Key::F4, "f4"),
+            (egui::Key::F5, "f5"),
+            (egui::Key::F6, "f6"),
+            (egui::Key::F7, "f7"),
+            (egui::Key::F8, "f8"),
+            (egui::Key::F9, "f9"),
+            (egui::Key::F10, "f10"),
+            (egui::Key::F11, "f11"),
+            (egui::Key::F12, "f12"),
+        ];
+        for (k, name) in fkeys {
+            if ctx.input(|i| i.key_pressed(k)) {
+                if shift {
+                    self.run_dsl(&format!("scene save {name}"));
+                } else {
+                    self.run_dsl(&format!("scene recall {name}"));
+                }
+            }
+        }
+        // Instant ViewDockX pose scrubbing with Up / Down arrow keys!
+        if let Some(ref vd) = self.session.viewdock
+            && !vd.bundle.poses.is_empty()
+        {
+            let cur = vd.active_pose_idx;
+            let len = vd.bundle.poses.len();
+            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                let next = (cur + 1) % len;
+                let _ = self.session.select_dock_pose(next);
+                self.sync_viewport_scene();
+            } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                let prev = if cur == 0 { len - 1 } else { cur - 1 };
+                let _ = self.session.select_dock_pose(prev);
+                self.sync_viewport_scene();
+            }
+        }
+    }
 }
 
 impl eframe::App for BiomolCraftApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_craft_link_inbox();
+        self.handle_shortcuts(ctx);
+
         // Smooth trajectory animation playback for ANM modes, Rust MD, and OpenMM DCD trajectories
         if self.playing_trajectory {
             let interval =
                 Duration::from_secs_f32((1.0 / self.traj_fps.clamp(1.0, 60.0)).max(0.016));
             if self.last_frame_tick.elapsed() >= interval {
-                if let Some(ref mut mol) = self.session.molecule
+                if let Some(mol) = self.session.active_molecule_mut()
                     && mol.frames.len() > 1
                 {
                     let next = (mol.active_frame + 1) % mol.frames.len();
@@ -294,7 +480,7 @@ impl eframe::App for BiomolCraftApp {
                         self.open_path_input =
                             "/home/acs/Datos/CraftBio/campaigns/biologics_pilot/1N8Z.pdb"
                                 .to_string();
-                        self.run_dsl(&format!("open {}", self.open_path_input));
+                        self.run_dsl(&format!("open {} replace", self.open_path_input));
                         ui.close_menu();
                     }
                     if ui
@@ -304,7 +490,7 @@ impl eframe::App for BiomolCraftApp {
                         self.open_path_input =
                             "/home/acs/Datos/CraftBio/campaigns/biologics_pilot/5JDS.pdb"
                                 .to_string();
-                        self.run_dsl(&format!("open {}", self.open_path_input));
+                        self.run_dsl(&format!("open {} replace", self.open_path_input));
                         ui.close_menu();
                     }
                     if ui
@@ -314,7 +500,7 @@ impl eframe::App for BiomolCraftApp {
                         self.open_path_input =
                             "/home/acs/Datos/CraftBio/campaigns/biologics_pilot/1Y26.pdb"
                                 .to_string();
-                        self.run_dsl(&format!("open {}", self.open_path_input));
+                        self.run_dsl(&format!("open {} replace", self.open_path_input));
                         ui.close_menu();
                     }
                     ui.separator();
@@ -326,6 +512,20 @@ impl eframe::App for BiomolCraftApp {
                         ui.close_menu();
                     }
                     if ui
+                        .button("Export Binary glTF 2.0 (/tmp/biomolcraft.glb)")
+                        .clicked()
+                    {
+                        self.run_dsl("export_mesh /tmp/biomolcraft.glb");
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button("Export Wavefront OBJ (/tmp/biomolcraft.obj)")
+                        .clicked()
+                    {
+                        self.run_dsl("export_mesh /tmp/biomolcraft.obj");
+                        ui.close_menu();
+                    }
+                    if ui
                         .button("Save CraftScene (/tmp/biomolcraft.craftscene.json)")
                         .clicked()
                     {
@@ -334,11 +534,24 @@ impl eframe::App for BiomolCraftApp {
                     }
                 });
                 ui.menu_button("View", |ui| {
+                    if ui.button("Preset: ChimeraX Soft (White + SSAO)").clicked() {
+                        self.run_dsl("preset chimerax_soft");
+                        ui.close_menu();
+                    }
+                    if ui.button("Preset: PyMOL Publication White").clicked() {
+                        self.run_dsl("preset pub_white");
+                        ui.close_menu();
+                    }
+                    if ui.button("Preset: Dark Studio Rim").clicked() {
+                        self.run_dsl("preset pub_dark");
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui
                         .button(if self.dark_mode {
-                            "Light Studio Theme"
+                            "Light UI Chrome"
                         } else {
-                            "Dark Studio Theme"
+                            "Dark UI Chrome"
                         })
                         .clicked()
                     {
@@ -371,6 +584,11 @@ impl eframe::App for BiomolCraftApp {
                     }
                 });
                 ui.menu_button("Modules", |ui| {
+                    if ui.button("ViewDockX (DockCraft Poses & HYDE)").clicked() {
+                        self.right_tab = RightModuleTab::ViewDockX;
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     for (tab, id) in [
                         (RightModuleTab::Antibodies, ModuleId::AntibodiesVhh),
                         (RightModuleTab::NcRnaMrna, ModuleId::NcRnaMrna),
@@ -386,8 +604,8 @@ impl eframe::App for BiomolCraftApp {
                 });
                 ui.menu_button("Suite (CraftBio & ArtCraft)", |ui| {
                     for (lbl, bin) in [
-                        ("ChemCraft (Small-Mol, Synthesis & NRPs)", "chemcraft"),
                         ("DockCraft (SBDD Docking & FEP)", "dockcraft"),
+                        ("ChemCraft (Small-Mol, Synthesis & NRPs)", "chemcraft"),
                         ("AdmetCraft (ADMET & PBPK)", "admetcraft"),
                     ] {
                         if ui.button(lbl).clicked() {
@@ -398,7 +616,7 @@ impl eframe::App for BiomolCraftApp {
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        egui::RichText::new("BiomolCraft v0.3.0 · CraftBio 3D Biomolecular Studio")
+                        egui::RichText::new("BiomolCraft v0.4.0 · Multi-Model · SSAO · ViewDockX")
                             .strong()
                             .color(egui::Color32::from_rgb(56, 189, 248)),
                     );
@@ -411,14 +629,17 @@ impl eframe::App for BiomolCraftApp {
             .resizable(true)
             .default_height(155.0)
             .show(ctx, |ui| {
-                // Sequence strip & interactive trajectory timeline synced with 3D
                 let mut click_target: Option<(char, i32, char)> = None;
                 let mut requested_frame: Option<usize> = None;
-                if let Some(ref mol) = self.session.molecule {
+                if let Some(mol) = self.session.active_molecule() {
                     ui.horizontal(|ui| {
                         ui.strong("Sequence Strip:");
                         if mol.frames.len() > 1 {
-                            let play_lbl = if self.playing_trajectory { "⏸ Pause" } else { "▶ Play" };
+                            let play_lbl = if self.playing_trajectory {
+                                "⏸ Pause"
+                            } else {
+                                "▶ Play"
+                            };
                             if ui.small_button(play_lbl).clicked() {
                                 self.playing_trajectory = !self.playing_trajectory;
                                 self.last_frame_tick = Instant::now();
@@ -435,37 +656,46 @@ impl eframe::App for BiomolCraftApp {
                         }
                         ui.small(&self.picked_atom_info);
                     });
-                    egui::ScrollArea::horizontal().max_height(34.0).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            for ch in &mol.chains {
-                                if !matches!(
-                                    ch.dominant_class,
-                                    ResidueClass::Protein | ResidueClass::Rna | ResidueClass::Dna
-                                ) {
-                                    continue;
-                                }
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(56, 189, 248),
-                                    format!("[{}]", ch.id),
-                                );
-                                for r in ch.residues.iter().take(140) {
-                                    if matches!(
-                                        r.class,
-                                        ResidueClass::Protein | ResidueClass::Rna | ResidueClass::Dna
-                                    ) && ui
-                                        .small_button(format!("{}", r.code))
-                                        .on_hover_text(format!("{}:{}{}", r.chain, r.res_name, r.res_seq))
-                                        .clicked()
-                                    {
-                                        click_target = Some((r.chain, r.res_seq, r.code));
+                    egui::ScrollArea::horizontal()
+                        .max_height(34.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for ch in &mol.chains {
+                                    if !matches!(
+                                        ch.dominant_class,
+                                        ResidueClass::Protein
+                                            | ResidueClass::Rna
+                                            | ResidueClass::Dna
+                                    ) {
+                                        continue;
+                                    }
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(56, 189, 248),
+                                        format!("[{}]", ch.id),
+                                    );
+                                    for r in ch.residues.iter().take(140) {
+                                        if matches!(
+                                            r.class,
+                                            ResidueClass::Protein
+                                                | ResidueClass::Rna
+                                                | ResidueClass::Dna
+                                        ) && ui
+                                            .small_button(format!("{}", r.code))
+                                            .on_hover_text(format!(
+                                                "{}:{}{}",
+                                                r.chain, r.res_name, r.res_seq
+                                            ))
+                                            .clicked()
+                                        {
+                                            click_target = Some((r.chain, r.res_seq, r.code));
+                                        }
                                     }
                                 }
-                            }
+                            });
                         });
-                    });
                 }
                 if let Some(f_idx) = requested_frame
-                    && let Some(ref mut mol) = self.session.molecule
+                    && let Some(mol) = self.session.active_molecule_mut()
                 {
                     mol.set_active_frame(f_idx);
                     self.session.dirty_geometry = true;
@@ -479,18 +709,22 @@ impl eframe::App for BiomolCraftApp {
                 }
 
                 ui.separator();
-                // PyMOL / ChimeraX Command Console
-                egui::ScrollArea::vertical().max_height(66.0).stick_to_bottom(true).show(ui, |ui| {
-                    for line in self.console_log.iter().rev().take(12).rev() {
-                        ui.monospace(line);
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(66.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in self.console_log.iter().rev().take(12).rev() {
+                            ui.monospace(line);
+                        }
+                    });
                 ui.horizontal(|ui| {
                     ui.strong("DSL>");
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.console_input)
                             .desired_width(ui.available_width() - 75.0)
-                            .hint_text("e.g. style cartoon; color esp; module antibodies; mutate B:105 A; minimize 60"),
+                            .hint_text(
+                                "e.g. fetch 1crn; preset pub_white; color mlp; surface on; scene save f1",
+                            ),
                     );
                     if (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                         || ui.button("Run").clicked()
@@ -503,114 +737,291 @@ impl eframe::App for BiomolCraftApp {
                 });
             });
 
-        // Left Panel: Scene Hierarchy, Representations, Colors & Quick Open
+        // Left Panel: Multi-Model Panel (#1..#N), Online Fetch, Representations, Colors, Side View & Scenes
         egui::SidePanel::left("biomol_scene_tree")
             .resizable(true)
-            .default_width(240.0)
+            .default_width(270.0)
             .show(ctx, |ui| {
-                ui.heading("Scene Hierarchy");
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.open_path_input).desired_width(155.0),
-                    );
-                    if ui.button("Open").clicked() {
-                        let p = self.open_path_input.clone();
-                        self.run_dsl(&format!("open {p}"));
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("Models & Fetch");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.open_path_input)
+                                .desired_width(142.0),
+                        );
+                        if ui.small_button("Open").clicked() {
+                            let p = self.open_path_input.clone();
+                            self.run_dsl(&format!("open {p} replace"));
+                        }
+                        if ui.small_button("+Add").clicked() {
+                            let p = self.open_path_input.clone();
+                            self.run_dsl(&format!("open {p} add"));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.fetch_id_input)
+                                .desired_width(165.0)
+                                .hint_text("1N8Z | af:P04626 | pubchem:2244"),
+                        );
+                        if ui.small_button("Fetch").clicked() {
+                            let id = self.fetch_id_input.clone();
+                            self.run_dsl(&format!("fetch {id}"));
+                        }
+                    });
+
+                    ui.separator();
+                    ui.strong(format!("Model Panel ({})", self.session.models.len()));
+                    let mut toggle_vis: Option<(usize, bool)> = None;
+                    let mut set_active: Option<usize> = None;
+                    let mut focus_idx: Option<usize> = None;
+                    let mut close_id: Option<u32> = None;
+                    for (idx, m) in self.session.models.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let mut v = m.visible;
+                            if ui.checkbox(&mut v, "").changed() {
+                                toggle_vis = Some((idx, v));
+                            }
+                            let is_act = idx == self.session.active_model_idx;
+                            if ui
+                                .selectable_label(is_act, format!("#{} {}", m.model_id, m.name))
+                                .clicked()
+                            {
+                                set_active = Some(idx);
+                            }
+                            if ui.small_button("◎").on_hover_text("Focus camera").clicked() {
+                                focus_idx = Some(idx);
+                            }
+                            if ui.small_button("×").on_hover_text("Close model").clicked() {
+                                close_id = Some(m.model_id);
+                            }
+                        });
+                    }
+                    if let Some((i, v)) = toggle_vis
+                        && let Some(m) = self.session.models.get_mut(i)
+                    {
+                        m.visible = v;
+                        self.session.dirty_geometry = true;
+                        self.sync_viewport_scene();
+                    }
+                    if let Some(i) = set_active
+                        && let Some(m) = self.session.models.get(i)
+                    {
+                        let mid = m.model_id;
+                        self.run_dsl(&format!("active #{mid}"));
+                    }
+                    if let Some(i) = focus_idx
+                        && let Some(m) = self.session.models.get(i)
+                    {
+                        let mol_clone = m.molecule.clone();
+                        self.session.camera.focus_on_biomolecule(&mol_clone);
+                    }
+                    if let Some(mid) = close_id {
+                        self.run_dsl(&format!("close #{mid}"));
+                    }
+
+                    ui.separator();
+                    ui.strong("Representation (Active Model)");
+                    for r in [
+                        RepresentationKind::Cartoon,
+                        RepresentationKind::NucleicLadder,
+                        RepresentationKind::Sticks,
+                        RepresentationKind::Spheres,
+                        RepresentationKind::Surface,
+                    ] {
+                        if ui
+                            .selectable_value(
+                                &mut self.session.render_opts.representation,
+                                r,
+                                r.label(),
+                            )
+                            .clicked()
+                        {
+                            self.session.dirty_geometry = true;
+                            self.sync_viewport_scene();
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.strong("Color By");
+                    for c in [
+                        ColorScheme::Chain,
+                        ColorScheme::SecondaryStructure,
+                        ColorScheme::Nucleotide,
+                        ColorScheme::ElementCpk,
+                        ColorScheme::BfactorPlddt,
+                        ColorScheme::Sap3D,
+                        ColorScheme::ElectrostaticEsp,
+                        ColorScheme::LipophilicityMlp,
+                    ] {
+                        if ui
+                            .selectable_value(
+                                &mut self.session.render_opts.color_scheme,
+                                c,
+                                c.label(),
+                            )
+                            .clicked()
+                        {
+                            self.session.dirty_geometry = true;
+                            self.sync_viewport_scene();
+                        }
+                    }
+                    ui.add_space(4.0);
+                    if ui
+                        .checkbox(
+                            &mut self.session.render_opts.show_surface_shell,
+                            "Smooth SES Surface Mesh",
+                        )
+                        .changed()
+                        || ui
+                            .checkbox(
+                                &mut self.session.render_opts.surface_wireframe,
+                                "Wireframe Mesh (isomesh)",
+                            )
+                            .changed()
+                        || ui
+                            .checkbox(
+                                &mut self.session.render_opts.show_rna_base_pairs,
+                                "3D RNA Base-Pair Rungs",
+                            )
+                            .changed()
+                        || ui
+                            .checkbox(
+                                &mut self.session.render_opts.show_silhouettes,
+                                "ChimeraX Depth Silhouettes",
+                            )
+                            .changed()
+                    {
+                        self.session.dirty_geometry = true;
+                        self.sync_viewport_scene();
+                    }
+
+                    ui.separator();
+                    egui::CollapsingHeader::new("Side View (Clip · SSAO · Lighting)")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            let mut changed = false;
+                            ui.horizontal(|ui| {
+                                ui.label("Light:");
+                                egui::ComboBox::from_id_salt("lighting_preset_cb")
+                                    .selected_text(self.session.render_opts.lighting.label())
+                                    .show_ui(ui, |ui| {
+                                        for lp in [
+                                            LightingPreset::Soft,
+                                            LightingPreset::PublicationWhite,
+                                            LightingPreset::Studio,
+                                            LightingPreset::Full,
+                                            LightingPreset::Flat,
+                                        ] {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut self.session.render_opts.lighting,
+                                                    lp,
+                                                    lp.label(),
+                                                )
+                                                .clicked()
+                                            {
+                                                changed = true;
+                                            }
+                                        }
+                                    });
+                            });
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut self.session.render_opts.ssao_strength,
+                                        0.0..=1.0,
+                                    )
+                                    .text("SSAO"),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut self.session.render_opts.surface_alpha,
+                                        0.2..=1.0,
+                                    )
+                                    .text("Surf α"),
+                                )
+                                .changed();
+                            ui.checkbox(
+                                &mut self.session.camera.clip_slab_enabled,
+                                "Enable Near/Far Clip Slab",
+                            );
+                            if self.session.camera.clip_slab_enabled {
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.session.camera.clip_near_a,
+                                        1.0..=100.0,
+                                    )
+                                    .text("Front Å"),
+                                );
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.session.camera.clip_far_a,
+                                        1.0..=120.0,
+                                    )
+                                    .text("Back Å"),
+                                );
+                            }
+                            if changed {
+                                self.session.dirty_geometry = true;
+                                self.sync_viewport_scene();
+                            }
+                        });
+
+                    ui.separator();
+                    egui::CollapsingHeader::new("Scenes (F1–F6 · Shift+Fn Save)")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                for s in ["f1", "f2", "f3", "f4", "f5", "f6"] {
+                                    let exists = self.session.scenes.contains_key(s);
+                                    let lbl = if exists {
+                                        format!("● {}", s.to_uppercase())
+                                    } else {
+                                        s.to_uppercase()
+                                    };
+                                    if ui.small_button(lbl).clicked() {
+                                        if exists {
+                                            self.run_dsl(&format!("scene recall {s}"));
+                                        } else {
+                                            self.run_dsl(&format!("scene save {s}"));
+                                        }
+                                    }
+                                }
+                            });
+                        });
+
+                    ui.separator();
+                    if let Some(mol) = self.session.active_molecule() {
+                        ui.strong(format!("Chains ({})", mol.chains.len()));
+                        for ch in &mol.chains {
+                            let badge = match ch.dominant_class {
+                                ResidueClass::Protein => "[PROT]",
+                                ResidueClass::Rna => "[RNA]",
+                                ResidueClass::Dna => "[DNA]",
+                                ResidueClass::Ligand => "[LIG]",
+                                ResidueClass::Ion => "[ION]",
+                                ResidueClass::Water => "[WAT]",
+                            };
+                            ui.small(format!(
+                                "{badge} Chain {} — {} res",
+                                ch.id,
+                                ch.residues.len()
+                            ));
+                        }
                     }
                 });
-                ui.separator();
-
-                ui.strong("Representation");
-                for r in [
-                    RepresentationKind::Cartoon,
-                    RepresentationKind::NucleicLadder,
-                    RepresentationKind::Sticks,
-                    RepresentationKind::Spheres,
-                    RepresentationKind::Surface,
-                ] {
-                    if ui
-                        .selectable_value(
-                            &mut self.session.render_opts.representation,
-                            r,
-                            r.label(),
-                        )
-                        .clicked()
-                    {
-                        self.session.dirty_geometry = true;
-                        self.sync_viewport_scene();
-                    }
-                }
-                ui.add_space(6.0);
-                ui.strong("Color By");
-                for c in [
-                    ColorScheme::Chain,
-                    ColorScheme::SecondaryStructure,
-                    ColorScheme::Nucleotide,
-                    ColorScheme::ElementCpk,
-                    ColorScheme::BfactorPlddt,
-                    ColorScheme::Sap3D,
-                    ColorScheme::ElectrostaticEsp,
-                ] {
-                    if ui
-                        .selectable_value(&mut self.session.render_opts.color_scheme, c, c.label())
-                        .clicked()
-                    {
-                        self.session.dirty_geometry = true;
-                        self.sync_viewport_scene();
-                    }
-                }
-                ui.add_space(6.0);
-                if ui
-                    .checkbox(
-                        &mut self.session.render_opts.show_surface_shell,
-                        "Translucent Surface Shell",
-                    )
-                    .changed()
-                    || ui
-                        .checkbox(
-                            &mut self.session.render_opts.show_rna_base_pairs,
-                            "3D RNA Base-Pair Rungs",
-                        )
-                        .changed()
-                    || ui
-                        .checkbox(
-                            &mut self.session.render_opts.show_silhouettes,
-                            "ChimeraX Silhouettes",
-                        )
-                        .changed()
-                {
-                    self.session.dirty_geometry = true;
-                    self.sync_viewport_scene();
-                }
-
-                ui.separator();
-                if let Some(ref mol) = self.session.molecule {
-                    ui.strong(format!("Chains ({})", mol.chains.len()));
-                    for ch in &mol.chains {
-                        let badge = match ch.dominant_class {
-                            ResidueClass::Protein => "[PROT]",
-                            ResidueClass::Rna => "[RNA]",
-                            ResidueClass::Dna => "[DNA]",
-                            ResidueClass::Ligand => "[LIG]",
-                            ResidueClass::Ion => "[ION]",
-                            ResidueClass::Water => "[WAT]",
-                        };
-                        ui.small(format!(
-                            "{badge} Chain {} — {} res",
-                            ch.id,
-                            ch.residues.len()
-                        ));
-                    }
-                }
             });
 
         // Right Dockable Biomolecular Module Panel
         egui::SidePanel::right("biomol_modules_panel")
             .resizable(true)
-            .default_width(340.0)
+            .default_width(360.0)
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for (t, lbl) in [
+                        (RightModuleTab::ViewDockX, "ViewDockX"),
                         (RightModuleTab::Modeling, "Model 3D"),
                         (RightModuleTab::Physics, "Physics"),
                         (RightModuleTab::CryoEm, "Cryo-EM"),
@@ -627,6 +1038,7 @@ impl eframe::App for BiomolCraftApp {
                 });
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| match self.right_tab {
+                    RightModuleTab::ViewDockX => self.ui_viewdockx_module(ui),
                     RightModuleTab::Modeling => self.ui_modeling_module(ui),
                     RightModuleTab::Physics => self.ui_physics_module(ui),
                     RightModuleTab::CryoEm => self.ui_cryoem_module(ui),
@@ -640,7 +1052,7 @@ impl eframe::App for BiomolCraftApp {
                 });
             });
 
-        // Center Primary 3D GPU Biomolecular Viewport (80% visual focus)
+        // Center Primary 3D GPU Biomolecular Viewport (Offscreen Depth32Float + SSAO)
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
@@ -653,7 +1065,7 @@ impl eframe::App for BiomolCraftApp {
                 );
                 if resp.clicked()
                     && let Some(pos) = resp.interact_pointer_pos()
-                    && let Some(ref mol) = self.session.molecule
+                    && let Some(mol) = self.session.active_molecule()
                 {
                     let rect = resp.rect;
                     let nx = ((pos.x - rect.left()) / rect.width().max(1.0)) * 2.0 - 1.0;
@@ -674,6 +1086,198 @@ impl eframe::App for BiomolCraftApp {
 }
 
 impl BiomolCraftApp {
+    fn ui_viewdockx_module(&mut self, ui: &mut egui::Ui) {
+        ui.heading("ViewDockX · DockCraft Craft Link v1");
+        ui.horizontal(|ui| {
+            if ui.button("Fit GridBox to Selection").clicked() {
+                self.run_dsl("gridbox from_selection 5.0");
+            }
+            if ui.button("Dock Here in DockCraft").clicked() {
+                self.dock_here_in_dockcraft();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Ligand SDF/SMI:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.dock_ligand_input)
+                    .desired_width(210.0)
+                    .hint_text("optional path (empty = open DockCraft GUI)"),
+            );
+        });
+
+        let mut dirty = false;
+        let mut select_pose: Option<usize> = None;
+        let mut cycle_tag: Option<usize> = None;
+
+        if let Some(ref mut vd) = self.session.viewdock {
+            ui.separator();
+            ui.strong(format!(
+                "{} — {} pose(s) (↑/↓ keys scrub poses)",
+                vd.bundle.title,
+                vd.bundle.poses.len()
+            ));
+            ui.horizontal_wrapped(|ui| {
+                dirty |= ui
+                    .checkbox(&mut vd.show_hyde_coronas, "HYDE Coronas")
+                    .changed();
+                dirty |= ui
+                    .checkbox(&mut vd.show_torsion_lights, "Torsion Lights")
+                    .changed();
+                dirty |= ui
+                    .checkbox(&mut vd.show_interactions, "Interactions")
+                    .changed();
+                dirty |= ui
+                    .checkbox(&mut vd.show_pharmacophores, "Pharmacophores")
+                    .changed();
+                dirty |= ui
+                    .checkbox(&mut vd.show_dmif_hotspots, "ΔMIF Selectivity")
+                    .changed();
+                dirty |= ui
+                    .checkbox(&mut vd.show_bridging_waters, "Bridging Waters")
+                    .changed();
+                dirty |= ui.checkbox(&mut vd.show_grid_box, "3D GridBox").changed();
+            });
+
+            if let Some(ref mut gb) = vd.editable_grid_box {
+                egui::CollapsingHeader::new("Editable 3D GridBox (Synced → DockCraft)")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        for (ax, lbl) in ["X", "Y", "Z"].iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("C{lbl}"));
+                                dirty |= ui
+                                    .add(egui::DragValue::new(&mut gb.center[ax]).speed(0.25))
+                                    .changed();
+                                ui.label(format!("S{lbl}"));
+                                dirty |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut gb.size[ax])
+                                            .speed(0.25)
+                                            .range(10.0..=64.0),
+                                    )
+                                    .changed();
+                            });
+                        }
+                    });
+            }
+
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .id_salt("viewdock_poses_scroll")
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    for (idx, p) in vd.bundle.poses.iter().enumerate() {
+                        let is_sel = idx == vd.active_pose_idx;
+                        let tag = vd
+                            .pose_tags
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(PoseStatusTag::Unreviewed);
+                        ui.horizontal(|ui| {
+                            if ui.small_button(tag.short_label()).clicked() {
+                                cycle_tag = Some(idx);
+                            }
+                            let hyde_s = p
+                                .hyde_kcal
+                                .map_or_else(|| "—".to_string(), |v| format!("{v:.2}"));
+                            let pb_s = match p.posebusters_valid {
+                                Some(true) => "PB✓",
+                                Some(false) => "PB!",
+                                None => "",
+                            };
+                            let lbl = format!(
+                                "#{} {} | V:{:.2} H:{} {}",
+                                p.pose_id, p.name, p.vina_kcal, hyde_s, pb_s
+                            );
+                            if ui.selectable_label(is_sel, lbl).clicked() {
+                                select_pose = Some(idx);
+                            }
+                        });
+                    }
+                });
+
+            if let Some(active) = vd.bundle.poses.get(vd.active_pose_idx) {
+                ui.separator();
+                ui.strong(format!("Active Pose: {}", active.name));
+                if let Some(ki) = active.estimated_ki_nm {
+                    ui.small(format!(
+                        "Vina {:.2} | HYDE {:?} | Est. Ki {:.1} nM | LE {:.3}",
+                        active.vina_kcal,
+                        active.hyde_kcal,
+                        ki,
+                        active.ligand_efficiency.unwrap_or(0.0)
+                    ));
+                }
+                if let Some(tc) = active.torsion_counts {
+                    ui.small(format!(
+                        "Torsion Lights: {} Green · {} Yellow · {} Red | Interactions: {}",
+                        tc[0],
+                        tc[1],
+                        tc[2],
+                        active.interaction_lines.len()
+                    ));
+                }
+                if let Some(ref pbs) = active.posebusters_summary {
+                    ui.small(format!("PoseBusters: {pbs}"));
+                }
+            }
+        } else {
+            ui.separator();
+            ui.small(
+                "No ViewDockX bundle loaded yet.\n\
+                 • From DockCraft GUI: click 'BiomolCraft' to stream poses, HYDE coronas, torsion lights, pharmacophores & ΔMIF live over Craft Link v1.\n\
+                 • From CLI: `dockcraft-cli dock ... --out-dock-bundle out.json` then `load_dock out.json`.\n\
+                 • Or select pocket residues here and click 'Box ← BiomolCraft' inside DockCraft!",
+            );
+            if let Some(ref mut gb) = self.session.render_opts.grid_box {
+                ui.separator();
+                ui.strong("Custom 3D GridBox (Active → DockCraft)");
+                for (ax, lbl) in ["X", "Y", "Z"].iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("C{lbl}"));
+                        dirty |= ui
+                            .add(egui::DragValue::new(&mut gb.center[ax]).speed(0.25))
+                            .changed();
+                        ui.label(format!("S{lbl}"));
+                        dirty |= ui
+                            .add(
+                                egui::DragValue::new(&mut gb.size[ax])
+                                    .speed(0.25)
+                                    .range(10.0..=64.0),
+                            )
+                            .changed();
+                    });
+                }
+            } else if ui
+                .button("+ Create Default GridBox at Camera Target")
+                .clicked()
+            {
+                let t = self.session.camera.target;
+                self.session.render_opts.grid_box = Some(GridBox3D {
+                    center: [f64::from(t[0]), f64::from(t[1]), f64::from(t[2])],
+                    size: [20.0, 20.0, 20.0],
+                    spacing: 0.375,
+                });
+                dirty = true;
+            }
+        }
+
+        if let Some(idx) = cycle_tag
+            && let Some(ref mut vd) = self.session.viewdock
+            && let Some(tag) = vd.pose_tags.get_mut(idx)
+        {
+            *tag = tag.cycle();
+        }
+        if let Some(idx) = select_pose {
+            let _ = self.session.select_dock_pose(idx);
+            dirty = true;
+        }
+        if dirty {
+            self.session.dirty_geometry = true;
+            self.sync_viewport_scene();
+        }
+    }
+
     fn ui_modeling_module(&mut self, ui: &mut egui::Ui) {
         ui.heading("Interactive 3D Mutagenesis & MM Sculpting");
         ui.horizontal(|ui| {
@@ -780,9 +1384,9 @@ impl BiomolCraftApp {
         if ui
             .button("Analyze & Paint CDRs / Ala-Scan Hotspots in 3D")
             .clicked()
-            && let Some(ref mol) = self.session.molecule
+            && let Some(mol) = self.session.active_molecule().cloned()
         {
-            match run_antibody_module(mol, None, None) {
+            match run_antibody_module(&mol, None, None) {
                 Ok(b) => {
                     self.session.render_opts.residue_highlights = b.visual.residue_highlights;
                     self.session.render_opts.sphere_overlays = b.visual.sphere_overlays;
@@ -826,8 +1430,8 @@ impl BiomolCraftApp {
                 self.rna_report = Some(rep);
             }
             if ui.button("Sync Active 3D RNA Chains").clicked()
-                && let Some(ref mol) = self.session.molecule
-                && let Ok((vis, mut reps)) = run_ncrna_module(mol)
+                && let Some(mol) = self.session.active_molecule().cloned()
+                && let Ok((vis, mut reps)) = run_ncrna_module(&mol)
             {
                 self.session.render_opts.representation = RepresentationKind::NucleicLadder;
                 self.session.render_opts.color_scheme = ColorScheme::Nucleotide;
@@ -872,9 +1476,9 @@ impl BiomolCraftApp {
         if ui
             .button("Detect Active Site / Metal Coordination in 3D")
             .clicked()
-            && let Some(ref mol) = self.session.molecule
+            && let Some(mol) = self.session.active_molecule().cloned()
         {
-            let vis = run_enzyme_module(mol);
+            let vis = run_enzyme_module(&mol);
             self.session.render_opts.residue_highlights = vis.residue_highlights;
             self.session.render_opts.sphere_overlays = vis.sphere_overlays;
             self.session.render_opts.line_overlays = vis.line_overlays;
@@ -902,9 +1506,14 @@ impl BiomolCraftApp {
         });
         ui.horizontal(|ui| {
             if ui.button("Map 3D ADC Sites + AdmetCraft").clicked()
-                && let Some(ref mol) = self.session.molecule
-                && let Ok((vis, _)) =
-                    run_adc_module(mol, &self.adc_linker, &self.adc_payload, self.adc_dar, true)
+                && let Some(mol) = self.session.active_molecule().cloned()
+                && let Ok((vis, _)) = run_adc_module(
+                    &mol,
+                    &self.adc_linker,
+                    &self.adc_payload,
+                    self.adc_dar,
+                    true,
+                )
             {
                 self.session.render_opts.residue_highlights = vis.residue_highlights;
                 self.session.render_opts.sphere_overlays = vis.sphere_overlays;
@@ -943,8 +1552,18 @@ impl BiomolCraftApp {
                     .speed(0.1),
             );
         });
+        if ui
+            .checkbox(
+                &mut self.session.volume_wireframe,
+                "Wireframe Isomesh Density",
+            )
+            .changed()
+        {
+            self.session.dirty_geometry = true;
+            self.sync_viewport_scene();
+        }
         ui.horizontal(|ui| {
-            if ui.button("Synthesize MolMap + Contour").clicked() {
+            if ui.button("Synthesize MolMap + Isosurface Mesh").clicked() {
                 let cmd = format!("molmap {:.1} {:.1}", self.cryoem_res_a, self.cryoem_sigma);
                 self.run_dsl(&cmd);
             }
@@ -1041,17 +1660,18 @@ impl BiomolCraftApp {
 }
 
 fn main() -> eframe::Result<()> {
+    let startup = parse_startup_args();
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1480.0, 900.0])
-            .with_title("BiomolCraft v0.1.0 — CraftBio Biomolecular 3D Studio"),
+            .with_inner_size([1520.0, 920.0])
+            .with_title("BiomolCraft v0.4.0 — CraftBio Multi-Model 3D Studio & ViewDockX"),
         ..Default::default()
     };
     eframe::run_native(
         "BiomolCraft",
         options,
-        Box::new(|_cc| Ok(Box::new(BiomolCraftApp::default()))),
+        Box::new(move |_cc| Ok(Box::new(BiomolCraftApp::with_startup(startup)))),
     )
 }
 

@@ -23,13 +23,14 @@ use biomol_physics::{
 use biomol_rna::{
     analyze_ncrna_mrna, find_rna_preset, render_rna_arc_svg, render_rna_markdown, rna_presets,
 };
-use biomol_script::BiomolSession;
+use biomol_script::{BiomolSession, fetch_structure_spec};
 use clap::{Parser, Subcommand};
 use craftbio_report::{export_artcraft_bundle, write_biomol_html_dossier};
 use craftbio_sandbox::{DEFAULT_MAX_FILE_BYTES, PathSandbox, inspect_wasm_plugin};
 use craftbio_scene::{
-    CraftSceneDocument, discover_craft_instances, push_scene_via_craft_link,
-    send_dsl_via_craft_link, send_trajectory_via_craft_link,
+    CraftSceneDocument, DockCraftSceneBundle, discover_craft_instances,
+    push_dockcraft_bundle_via_craft_link, push_scene_via_craft_link, send_dsl_via_craft_link,
+    send_trajectory_via_craft_link,
 };
 use craftbio_struct::{
     load_dcd_frames, matchmaker_align, parse_dx_map, parse_mrc_map, parse_structure_auto,
@@ -57,7 +58,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Render a publication-grade 3D biomolecular PNG headlessly (up to 4K 3840x2160).
+    /// Render a publication-grade 3D biomolecular PNG headlessly (triangulated Cartoon/SES + SSAO + up to 4K).
     Render {
         #[arg(long)]
         pdb: PathBuf,
@@ -70,7 +71,7 @@ enum Commands {
         #[arg(
             long,
             default_value = "chain",
-            help = "chain | ss | cpk | nucleotide | plddt | sap | esp"
+            help = "chain | ss | cpk | nucleotide | plddt | sap | esp | mlp"
         )]
         color: String,
         #[arg(
@@ -78,8 +79,21 @@ enum Commands {
             help = "Optional module overlay: antibodies | ncrna | enzymes | adc"
         )]
         module: Option<String>,
+        #[arg(
+            long,
+            help = "Optional publication preset: pub_white | pub_dark | chimerax_soft | pymol_ray"
+        )]
+        preset: Option<String>,
         #[arg(long)]
         surface: bool,
+        #[arg(long)]
+        wireframe: bool,
+        #[arg(long, default_value_t = 0.60)]
+        ssao: f32,
+        #[arg(long)]
+        clip_near: Option<f32>,
+        #[arg(long)]
+        clip_far: Option<f32>,
         #[arg(long, default_value_t = 1600)]
         width: u32,
         #[arg(long, default_value_t = 1200)]
@@ -88,6 +102,47 @@ enum Commands {
         transparent: bool,
         #[arg(long)]
         out_png: PathBuf,
+        #[arg(long)]
+        out_glb: Option<PathBuf>,
+        #[arg(long)]
+        out_obj: Option<PathBuf>,
+    },
+    /// Fetch a biomolecular structure or map online (RCSB PDB, af:UNIPROT, emdb:ID, pubchem:CID) with local cache.
+    Fetch {
+        #[arg(long, help = "e.g. 1N8Z, pdb:1CRN, af:P04626, emdb:1234, pubchem:2244")]
+        id: String,
+        #[arg(long, help = "Optional destination path to copy the fetched file")]
+        out: Option<PathBuf>,
+    },
+    /// Export triangulated 3D Cartoon / SES / Nucleic meshes to binary glTF 2.0 (.glb) or Wavefront (.obj).
+    ExportMesh {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long, default_value = "cartoon")]
+        style: String,
+        #[arg(long, default_value = "chain")]
+        color: String,
+        #[arg(long)]
+        surface: bool,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Render or inspect a rich DockCraft ViewDockX bundle (receptor + pose + HYDE coronas + torsion lights + ΔMIF + GridBox).
+    Viewdock {
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        pose: usize,
+        #[arg(long)]
+        preset: Option<String>,
+        #[arg(long, default_value_t = 1600)]
+        width: u32,
+        #[arg(long, default_value_t = 1200)]
+        height: u32,
+        #[arg(long)]
+        out_png: Option<PathBuf>,
+        #[arg(long)]
+        push_live: bool,
     },
     /// Sequence-guided MatchMaker / Kabsch 3D structural alignment (Proteins & RNA/DNA).
     Align {
@@ -355,11 +410,129 @@ fn run() -> Result<(), String> {
             style,
             color,
             module,
+            preset,
             surface,
+            wireframe,
+            ssao,
+            clip_near,
+            clip_far,
             width,
             height,
             transparent,
             out_png,
+            out_glb,
+            out_obj,
+        } => {
+            let mut sess = BiomolSession::default();
+            sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+            let _ = sess
+                .execute_dsl(&format!("style {style}; color {color}; ssao {ssao:.2}"))
+                .map_err(|e| e.to_string())?;
+            if let Some(p) = preset {
+                let _ = sess
+                    .execute_dsl(&format!("preset {p}"))
+                    .map_err(|e| e.to_string())?;
+            }
+            if wireframe {
+                let _ = sess
+                    .execute_dsl("surface wireframe")
+                    .map_err(|e| e.to_string())?;
+            } else if surface {
+                let _ = sess.execute_dsl("surface on").map_err(|e| e.to_string())?;
+            }
+            if let Some(m) = module {
+                let _ = sess
+                    .execute_dsl(&format!("module {m}"))
+                    .map_err(|e| e.to_string())?;
+            }
+            if clip_near.is_some() || clip_far.is_some() {
+                let cn = clip_near.unwrap_or(20.0);
+                let cf = clip_far.unwrap_or(20.0);
+                let _ = sess
+                    .execute_dsl(&format!("clip {cn:.2} {cf:.2}"))
+                    .map_err(|e| e.to_string())?;
+            }
+            let scene = sess.build_viewport_scene();
+            let title = sess
+                .active_molecule()
+                .map_or_else(|| "BiomolCraft".to_string(), |m| m.title.clone());
+            if let Some(glb_p) = out_glb {
+                let glb = scene.export_glb(&title);
+                if let Some(p) = glb_p.parent()
+                    && !p.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&glb_p, &glb).map_err(|e| e.to_string())?;
+                println!(
+                    "Exported glTF 2.0 (.glb) -> {} ({} bytes)",
+                    glb_p.display(),
+                    glb.len()
+                );
+            }
+            if let Some(obj_p) = out_obj {
+                let obj = scene.export_obj(&title);
+                write_text(&obj_p, &obj)?;
+                println!(
+                    "Exported Wavefront OBJ -> {} ({} bytes)",
+                    obj_p.display(),
+                    obj.len()
+                );
+            }
+            let bytes = write_scene_png(&scene, &sess.camera, width, height, transparent, &out_png)
+                .map_err(|e| e.to_string())?;
+            println!(
+                "Rendered {}x{} PNG to {} ({bytes} bytes, op_meshes={}, tr_meshes={}, spheres={}, capsules={})",
+                width,
+                height,
+                out_png.display(),
+                scene.opaque_meshes.len(),
+                scene.transparent_meshes.len(),
+                scene.spheres.len(),
+                scene.capsules.len()
+            );
+        }
+        Commands::Fetch { id, out } => {
+            let asset = fetch_structure_spec(&id)?;
+            if let Some(dest) = out {
+                if let Some(p) = dest.parent()
+                    && !p.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+                }
+                std::fs::copy(&asset.local_path, &dest).map_err(|e| e.to_string())?;
+                println!(
+                    "Fetched {} {} ({}) -> {} (copied to {})",
+                    asset.provider,
+                    asset.canonical_id,
+                    if asset.cached_hit {
+                        "cache hit"
+                    } else {
+                        "downloaded"
+                    },
+                    asset.local_path.display(),
+                    dest.display()
+                );
+            } else {
+                println!(
+                    "Fetched {} {} ({}) -> {}",
+                    asset.provider,
+                    asset.canonical_id,
+                    if asset.cached_hit {
+                        "cache hit"
+                    } else {
+                        "downloaded"
+                    },
+                    asset.local_path.display()
+                );
+            }
+        }
+        Commands::ExportMesh {
+            pdb,
+            style,
+            color,
+            surface,
+            out,
         } => {
             let mut sess = BiomolSession::default();
             sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
@@ -369,22 +542,60 @@ fn run() -> Result<(), String> {
             if surface {
                 let _ = sess.execute_dsl("surface on").map_err(|e| e.to_string())?;
             }
-            if let Some(m) = module {
+            let msg = sess
+                .execute_dsl(&format!("export_mesh {}", out.display()))
+                .map_err(|e| e.to_string())?;
+            println!("{msg}");
+        }
+        Commands::Viewdock {
+            bundle,
+            pose,
+            preset,
+            width,
+            height,
+            out_png,
+            push_live,
+        } => {
+            let raw = std::fs::read_to_string(&bundle).map_err(|e| e.to_string())?;
+            let parsed: DockCraftSceneBundle =
+                serde_json::from_str(&raw).map_err(|e| format!("bad dock bundle JSON: {e}"))?;
+            if push_live {
+                let instances = discover_craft_instances(None, Some("biomolcraft"))
+                    .map_err(|e| e.to_string())?;
+                let target = instances
+                    .first()
+                    .ok_or("no running BiomolCraft instance on Craft Link v1")?;
+                let rep = push_dockcraft_bundle_via_craft_link(target, &parsed)
+                    .map_err(|e| e.to_string())?;
+                println!("Pushed ViewDockX bundle over Craft Link v1: {rep}");
+            }
+            let mut sess = BiomolSession::default();
+            let msg = sess
+                .load_dockcraft_bundle(parsed)
+                .map_err(|e| e.to_string())?;
+            println!("{msg}");
+            if pose > 0 {
+                println!(
+                    "{}",
+                    sess.select_dock_pose(pose).map_err(|e| e.to_string())?
+                );
+            }
+            if let Some(p) = preset {
                 let _ = sess
-                    .execute_dsl(&format!("module {m}"))
+                    .execute_dsl(&format!("preset {p}"))
                     .map_err(|e| e.to_string())?;
             }
-            let scene = sess.build_viewport_scene();
-            let bytes = write_scene_png(&scene, &sess.camera, width, height, transparent, &out_png)
-                .map_err(|e| e.to_string())?;
-            println!(
-                "Rendered {}x{} PNG to {} ({bytes} bytes, spheres={}, capsules={})",
-                width,
-                height,
-                out_png.display(),
-                scene.spheres.len(),
-                scene.capsules.len()
-            );
+            if let Some(png_p) = out_png {
+                let sc = sess.build_viewport_scene();
+                let bytes = write_scene_png(&sc, &sess.camera, width, height, false, &png_p)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "Rendered ViewDockX {}x{} PNG to {} ({bytes} bytes).",
+                    width,
+                    height,
+                    png_p.display()
+                );
+            }
         }
         Commands::Align {
             mobile,
@@ -492,12 +703,12 @@ fn run() -> Result<(), String> {
         } => {
             let mut sess = BiomolSession::default();
             sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
-            let mol = sess.molecule.as_ref().ok_or("load failed")?;
+            let mol = sess.active_molecule().ok_or("load failed")?.clone();
             let vis = match name.to_ascii_lowercase().as_str() {
-                "antibodies" | "ab" | "vhh" => run_antibody_module(mol, None, None)?.visual,
-                "ncrna" | "rna" | "mrna" => run_ncrna_module(mol)?.0,
-                "enzymes" | "enzyme" => run_enzyme_module(mol),
-                "adc" => run_adc_module(mol, "ggfg", "dxd", 8.0, true)?.0,
+                "antibodies" | "ab" | "vhh" => run_antibody_module(&mol, None, None)?.visual,
+                "ncrna" | "rna" | "mrna" => run_ncrna_module(&mol)?.0,
+                "enzymes" | "enzyme" => run_enzyme_module(&mol),
+                "adc" => run_adc_module(&mol, "ggfg", "dxd", 8.0, true)?.0,
                 other => return Err(format!("unknown module '{other}'")),
             };
             if let Some(p) = out_md {
@@ -507,6 +718,7 @@ fn run() -> Result<(), String> {
                 sess.render_opts.residue_highlights = vis.residue_highlights;
                 sess.render_opts.sphere_overlays = vis.sphere_overlays;
                 sess.render_opts.line_overlays = vis.line_overlays;
+                sess.sync_active_render_opts();
                 let doc = sess.to_craftscene_document();
                 write_text(
                     &p,
@@ -600,16 +812,21 @@ fn run() -> Result<(), String> {
         } => {
             let mut sess = BiomolSession::default();
             sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
-            let mol = sess.molecule.as_mut().ok_or("no molecule")?;
-            let (vis, _) = run_physics_anm_module(mol, mode, amp, frames)?;
+            let (vis, traj_txt) = {
+                let mol = sess.active_molecule_mut().ok_or("no molecule")?;
+                let (v, _) = run_physics_anm_module(mol, mode, amp, frames)?;
+                let t = out_traj_pdb.as_ref().map(|_| write_multi_model_pdb(mol));
+                (v, t)
+            };
             if let Some(p) = out_md {
                 write_text(&p, &vis.summary_markdown)?;
             }
-            if let Some(p) = out_traj_pdb {
-                write_text(&p, &write_multi_model_pdb(mol))?;
+            if let (Some(p), Some(t)) = (out_traj_pdb, traj_txt) {
+                write_text(&p, &t)?;
             }
             sess.render_opts.residue_highlights = vis.residue_highlights;
             sess.render_opts.line_overlays = vis.line_overlays;
+            sess.sync_active_render_opts();
             sess.dirty_geometry = true;
             if let Some(p) = out_png {
                 let sc = sess.build_viewport_scene();
@@ -740,8 +957,8 @@ fn run() -> Result<(), String> {
         } => {
             let mut sess = BiomolSession::default();
             sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
-            let mol = sess.molecule.as_ref().ok_or("no molecule")?;
-            let (vis, rep) = run_enzyme_engineering_module(mol);
+            let mol = sess.active_molecule().ok_or("no molecule")?.clone();
+            let (vis, rep) = run_enzyme_engineering_module(&mol);
             if let Some(p) = out_md {
                 write_text(&p, &vis.summary_markdown)?;
             }
@@ -749,6 +966,7 @@ fn run() -> Result<(), String> {
                 sess.render_opts.residue_highlights = vis.residue_highlights;
                 sess.render_opts.sphere_overlays = vis.sphere_overlays;
                 sess.render_opts.line_overlays = vis.line_overlays;
+                sess.sync_active_render_opts();
                 sess.dirty_geometry = true;
                 let sc = sess.build_viewport_scene();
                 let bytes = write_scene_png(&sc, &sess.camera, 1600, 1200, false, &p)
@@ -808,11 +1026,11 @@ fn run() -> Result<(), String> {
                     let bytes = std::fs::read(&mp).map_err(|e| e.to_string())?;
                     parse_mrc_map(&mp.display().to_string(), &bytes).map_err(|e| e.to_string())?
                 };
-                let mol = sess.molecule.as_mut().ok_or("no molecule")?;
+                let mol = sess.active_molecule_mut().ok_or("no molecule")?;
                 let (v, _) = run_cryoem_volume_module(mol, &g, sigma, fit);
                 (v, g)
             } else {
-                let mol = sess.molecule.as_mut().ok_or("no molecule")?;
+                let mol = sess.active_molecule_mut().ok_or("no molecule")?;
                 let (v, g, _) = run_cryoem_molmap_module(mol, molmap_res, sigma)?;
                 (v, g)
             };
@@ -828,13 +1046,14 @@ fn run() -> Result<(), String> {
                 write_text(&p, &vis.summary_markdown)?;
             }
             if let Some(p) = out_png {
-                sess.render_opts.sphere_overlays = vis.sphere_overlays;
+                sess.active_volume = Some(grid);
+                sess.active_volume_sigma = sigma;
                 sess.dirty_geometry = true;
                 let sc = sess.build_viewport_scene();
                 let bytes = write_scene_png(&sc, &sess.camera, 1600, 1200, false, &p)
                     .map_err(|e| e.to_string())?;
                 println!(
-                    "Rendered Cryo-EM volumetric PNG to {} ({bytes} bytes).",
+                    "Rendered Cryo-EM Marching-Tetrahedra volumetric PNG to {} ({bytes} bytes).",
                     p.display()
                 );
             }
@@ -856,11 +1075,12 @@ fn run() -> Result<(), String> {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect();
-            let mol = sess.molecule.as_ref().ok_or("no molecule")?;
-            let (vis, _) = run_denovo_cofold_module(mol, chain, &hs, out_dir.as_deref())?;
+            let mol = sess.active_molecule().ok_or("no molecule")?.clone();
+            let (vis, _) = run_denovo_cofold_module(&mol, chain, &hs, out_dir.as_deref())?;
             if let Some(p) = out_png {
                 sess.render_opts.residue_highlights = vis.residue_highlights;
                 sess.render_opts.sphere_overlays = vis.sphere_overlays;
+                sess.sync_active_render_opts();
                 sess.dirty_geometry = true;
                 let sc = sess.build_viewport_scene();
                 let bytes = write_scene_png(&sc, &sess.camera, 1600, 1200, false, &p)
@@ -889,7 +1109,7 @@ fn run() -> Result<(), String> {
                         .execute_dsl(&format!("module {m}"))
                         .map_err(|e| e.to_string())?;
                     if m.eq_ignore_ascii_case("ncrna")
-                        && let Some(ref mol) = sess.molecule
+                        && let Some(mol) = sess.active_molecule()
                         && let Ok((_, reps)) = run_ncrna_module(mol)
                         && let Some(first) = reps.first()
                     {
@@ -897,7 +1117,7 @@ fn run() -> Result<(), String> {
                     }
                 }
             }
-            let mol = sess.molecule.as_ref().ok_or("no molecule")?;
+            let mol = sess.active_molecule().ok_or("no molecule")?;
             let mut svgs = Vec::new();
             if let Some(ref s) = extra_svg {
                 svgs.push(("ncRNA Base-Pair Arc Diagram", s.as_str()));
@@ -928,11 +1148,10 @@ fn run() -> Result<(), String> {
                     .map_err(|e| e.to_string())?;
             }
             let title = sess
-                .molecule
-                .as_ref()
+                .active_molecule()
                 .map_or_else(|| "BiomolCraft".to_string(), |m| m.title.clone());
-            let atoms = sess.molecule.as_ref().map_or(0, |m| m.atoms.len());
-            let chains = sess.molecule.as_ref().map_or(0, |m| m.chains.len());
+            let atoms = sess.active_molecule().map_or(0, |m| m.atoms.len());
+            let chains = sess.active_molecule().map_or(0, |m| m.chains.len());
             let sc = sess.build_viewport_scene();
             let png = render_scene_png_bytes(&sc, &sess.camera, 1600, 1200, false)
                 .map_err(|e| e.to_string())?;

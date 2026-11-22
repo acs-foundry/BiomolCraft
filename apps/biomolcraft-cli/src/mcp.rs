@@ -195,6 +195,42 @@ impl Tools for BiomolTools {
                 ),
                 Effect::Files,
             ),
+            tool(
+                "load_dockcraft_bundle",
+                "Load DockCraft ViewDockX Bundle",
+                "Load a DockCraft ViewDockX JSON bundle (receptor, poses SDF, HYDE coronas, torsion lights, pharmacophores, ΔMIF, GridBox) from the sandbox read root.",
+                object(
+                    json!({
+                        "path": string("Relative or sandbox-confined path to .dockbundle.json"),
+                        "pose": { "type": "integer", "description": "Optional 0-based pose index to activate (default 0)" }
+                    }),
+                    &["path"],
+                ),
+                Effect::Replaces,
+            ),
+            tool(
+                "export_mesh_3d",
+                "Export 3D Mesh (.glb / .obj)",
+                "Export the active triangulated Cartoon/SES/Cryo-EM scene to binary glTF 2.0 (.glb) or Wavefront (.obj) inside the sandbox write root.",
+                object(
+                    json!({ "out_path": string("Output filename (.glb or .obj) inside sandbox write root") }),
+                    &["out_path"],
+                ),
+                Effect::Files,
+            ),
+            tool(
+                "manage_scene",
+                "Manage BiomolCraft Scenes (F1-F12)",
+                "Save, recall, list, or delete named / F1-F12 multi-model camera & styling scenes.",
+                object(
+                    json!({
+                        "action": string("save | recall | list | delete"),
+                        "name": string("Optional scene name, e.g. 'f1' or 'active_site'")
+                    }),
+                    &["action"],
+                ),
+                Effect::Edits,
+            ),
         ]
     }
 
@@ -333,7 +369,7 @@ impl Tools for BiomolTools {
                         Ok(s) => s,
                         Err(e) => return text_result(e.to_string(), true),
                     }
-                } else if let Some(ref mol) = self.session.molecule {
+                } else if let Some(mol) = self.session.active_molecule() {
                     if out.ends_with(".cif") || out.ends_with(".mmcif") {
                         write_mmcif(mol)
                     } else {
@@ -410,7 +446,7 @@ impl Tools for BiomolTools {
             }
             "export_offline_html_dossier" => {
                 let out = args.get("out_path").and_then(Value::as_str).unwrap_or("");
-                let Some(ref mol) = self.session.molecule else {
+                let Some(mol) = self.session.active_molecule() else {
                     return text_result("no biomolecule loaded", true);
                 };
                 // Enforce PathSandbox write confinement by creating placeholder inside sandbox first
@@ -433,6 +469,72 @@ impl Tools for BiomolTools {
                         Err(e) => text_result(e, true),
                     },
                     Err(e) => text_result(format!("sandbox write rejected: {e}"), true),
+                }
+            }
+            "load_dockcraft_bundle" => {
+                let p = args.get("path").and_then(Value::as_str).unwrap_or("");
+                match self.sandbox.read_string(Path::new(p)) {
+                    Ok(raw) => {
+                        match serde_json::from_str::<craftbio_scene::DockCraftSceneBundle>(&raw) {
+                            Ok(bundle) => match self.session.load_dockcraft_bundle(bundle) {
+                                Ok(mut msg) => {
+                                    if let Some(pose_idx) = args.get("pose").and_then(Value::as_u64)
+                                        && pose_idx > 0
+                                        && let Ok(pm) =
+                                            self.session.select_dock_pose(pose_idx as usize)
+                                    {
+                                        msg.push('\n');
+                                        msg.push_str(&pm);
+                                    }
+                                    text_result(msg, false)
+                                }
+                                Err(e) => text_result(e.to_string(), true),
+                            },
+                            Err(e) => {
+                                text_result(format!("invalid DockCraftSceneBundle JSON: {e}"), true)
+                            }
+                        }
+                    }
+                    Err(e) => text_result(format!("sandbox read rejected: {e}"), true),
+                }
+            }
+            "export_mesh_3d" => {
+                let out = args.get("out_path").and_then(Value::as_str).unwrap_or("");
+                let scene = self.session.build_viewport_scene();
+                let title = self
+                    .session
+                    .active_molecule()
+                    .map_or_else(|| "BiomolCraft".to_string(), |m| m.title.clone());
+                let res = if out.to_ascii_lowercase().ends_with(".obj") {
+                    let obj = scene.export_obj(&title);
+                    self.sandbox
+                        .write_string(Path::new(out), &obj)
+                        .map(|p| (p, obj.len()))
+                } else {
+                    let glb = scene.export_glb(&title);
+                    self.sandbox
+                        .write_bytes(Path::new(out), &glb)
+                        .map(|p| (p, glb.len()))
+                };
+                match res {
+                    Ok((p, bytes)) => text_result(
+                        format!("Exported 3D mesh to {} ({bytes} bytes).", p.display()),
+                        false,
+                    ),
+                    Err(e) => text_result(format!("sandbox write rejected: {e}"), true),
+                }
+            }
+            "manage_scene" => {
+                let act = args.get("action").and_then(Value::as_str).unwrap_or("list");
+                let nm = args.get("name").and_then(Value::as_str).unwrap_or("f1");
+                let cmd = if act.eq_ignore_ascii_case("list") {
+                    "scene list".to_string()
+                } else {
+                    format!("scene {act} {nm}")
+                };
+                match self.session.execute_dsl(&cmd) {
+                    Ok(msg) => text_result(msg, false),
+                    Err(e) => text_result(e.to_string(), true),
                 }
             }
             other => text_result(format!("unknown tool '{other}'"), true),
@@ -499,7 +601,7 @@ mod tests {
             .pointer("/result/tools")
             .and_then(Value::as_array)
             .ok_or("no tools")?;
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 17);
 
         let rna = srv
             .handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fold_ncrna_mrna","arguments":{"preset":"guanine_riboswitch"}}}"#)

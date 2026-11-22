@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
@@ -39,11 +39,11 @@ unreachable = "deny"
 craft-mcp-server = { git = "https://github.com/storytold/craft-libs", rev = "52d2560c183b2df8b1ffc25ca2078683af146fd6" }
 
 # CraftBio shared libraries (public acs-foundry/craftbio-libs pinned tag)
-craftbio-sandbox = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v0.3.0" }
-craftbio-struct = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v0.3.0" }
-craftbio-scene = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v0.3.0" }
-craftbio-viewport = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v0.3.0" }
-craftbio-report = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v0.3.0" }
+craftbio-sandbox = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v0.4.0" }
+craftbio-struct = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v0.4.0" }
+craftbio-scene = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v0.4.0" }
+craftbio-viewport = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v0.4.0" }
+craftbio-report = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v0.4.0" }
 
 # Internal BiomolCraft biologics, modeling, physics & module crates (100% self-contained)
 bio-core = { path = "crates/bio-core" }
