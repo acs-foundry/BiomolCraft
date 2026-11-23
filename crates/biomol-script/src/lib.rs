@@ -49,8 +49,9 @@ use craftbio_viewport::{
 };
 pub use fetch::{FetchedAsset, fetch_structure_spec};
 pub use registry::{
-    COMMAND_REGISTRY, CommandSpec, CompletionItem, autocomplete_dsl, filter_command_palette,
-    render_registry_help,
+    COMMAND_REGISTRY, COMPUTE_VERBS, CommandSpec, CompletionItem, FILESYSTEM_VERBS,
+    autocomplete_dsl, filter_command_palette, render_registry_help, verb_is_sandbox_safe,
+    verb_touches_filesystem,
 };
 use serde::{Deserialize, Serialize};
 pub use session_zip::{
@@ -58,6 +59,131 @@ pub use session_zip::{
     load_session_zip, save_session_zip,
 };
 use thiserror::Error;
+
+/// Split a DSL script into executable statements, exactly as [`BiomolSession::execute_dsl`] does.
+///
+/// Callers that need to vet a script before running it (the MCP server) must use this
+/// function rather than their own splitter: any divergence between the two is a hole.
+#[must_use]
+pub fn split_dsl_statements(script: &str) -> Vec<&str> {
+    script
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.starts_with('#'))
+        .collect()
+}
+
+/// Extract the lowercase verb of a single DSL statement, exactly as the interpreter does.
+///
+/// The verb ends at the first whitespace character of any kind — space, tab, newline,
+/// vertical tab — which is why substring checks such as `contains("save ")` do not confine it.
+#[must_use]
+pub fn dsl_statement_verb(stmt: &str) -> String {
+    stmt.trim()
+        .split(char::is_whitespace)
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// Deepest parenthesis nesting, and longest chain of prefix operators, accepted from an
+/// untrusted caller.
+///
+/// The selection parser in `craftbio-struct` recurses once per nesting level, so a deep
+/// enough expression overflows the stack and aborts the process — which no `catch_unwind`
+/// can intercept. Hand-written selections nest a handful of levels; 64 is far beyond any
+/// real query and far below the thousands needed to exhaust the stack.
+pub const MAX_EXPRESSION_NESTING: usize = 64;
+
+/// Verdict of [`vet_dsl_for_sandbox`]: why a script may not run under a sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DslRejection {
+    /// The verb reads or writes files (or the network) with a caller-supplied path.
+    TouchesFilesystem(String),
+    /// The verb is not classified as sandbox-safe (unknown, or newly added and unclassified).
+    NotWhitelisted(String),
+    /// The expression nests deeply enough to threaten the parser's stack.
+    TooDeeplyNested { depth: usize },
+}
+
+/// Measure how deeply a statement nests: parenthesis depth, and the length of any run of
+/// prefix operators (`not`, `!`), which recurse just as parentheses do but carry no brackets.
+#[must_use]
+fn expression_nesting(stmt: &str) -> usize {
+    let mut depth = 0usize;
+    let mut max_depth = 0usize;
+    for c in stmt.chars() {
+        match c {
+            '(' | '[' => {
+                depth += 1;
+                max_depth = max_depth.max(depth);
+            }
+            ')' | ']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    let mut run = 0usize;
+    let mut max_run = 0usize;
+    for tok in stmt.split_whitespace() {
+        let t = tok.trim_start_matches(['(', '[']).to_ascii_lowercase();
+        if t == "not" || t == "!" {
+            run += 1;
+            max_run = max_run.max(run);
+        } else {
+            run = 0;
+        }
+    }
+
+    max_depth.max(max_run)
+}
+
+impl std::fmt::Display for DslRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TouchesFilesystem(v) => write!(
+                f,
+                "DSL command '{v}' performs its own file or network I/O and is not available over MCP; \
+                 use the dedicated sandboxed tools (`load_biomolecule`, `save_structure_or_scene`, \
+                 `render_view_png`, `export_mesh_3d`, `save_biomol_session`, …) instead"
+            ),
+            Self::NotWhitelisted(v) => write!(
+                f,
+                "DSL command '{v}' is not on the sandbox-safe command whitelist"
+            ),
+            Self::TooDeeplyNested { depth } => write!(
+                f,
+                "expression nests {depth} levels deep (limit {MAX_EXPRESSION_NESTING}); \
+                 such an expression would overflow the parser's stack"
+            ),
+        }
+    }
+}
+
+/// Vet a whole DSL script for execution on behalf of a sandbox-confined caller.
+///
+/// Every statement must carry a verb that only touches in-memory session state. Splitting
+/// uses the interpreter's own lexer, so a statement hidden behind `;`, a tab after the verb,
+/// or odd casing is seen exactly as the interpreter will see it.
+///
+/// # Errors
+/// Returns the first statement whose verb is not sandbox-safe.
+pub fn vet_dsl_for_sandbox(script: &str) -> Result<(), DslRejection> {
+    for stmt in split_dsl_statements(script) {
+        let verb = dsl_statement_verb(stmt);
+        if verb_touches_filesystem(&verb) {
+            return Err(DslRejection::TouchesFilesystem(verb));
+        }
+        if !verb_is_sandbox_safe(&verb) {
+            return Err(DslRejection::NotWhitelisted(verb));
+        }
+        let depth = expression_nesting(stmt);
+        if depth > MAX_EXPRESSION_NESTING {
+            return Err(DslRejection::TooDeeplyNested { depth });
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Error)]
 pub enum ScriptError {
@@ -479,16 +605,35 @@ impl BiomolSession {
     }
 
     /// Load a complete rich `DockCraftSceneBundle` into `#1` receptor + native **`ViewDockX`** session.
+    ///
+    /// Reads any file the bundle names with the caller's own permissions. Correct for the
+    /// desktop app, where the user picked the bundle; callers that handle bundles from an
+    /// untrusted source must use [`BiomolSession::load_dockcraft_bundle_with`] instead.
     pub fn load_dockcraft_bundle(
         &mut self,
         bundle: DockCraftSceneBundle,
+    ) -> Result<String, ScriptError> {
+        self.load_dockcraft_bundle_with(bundle, &|p| std::fs::read(p).map_err(|e| e.to_string()))
+    }
+
+    /// Load a `DockCraftSceneBundle`, reading the files it names through `read_file`.
+    ///
+    /// A bundle is data, not a trusted instruction: its `receptor_pdb_path` and
+    /// `trajectory_dcd_path` fields are chosen by whoever wrote the JSON. Passing a
+    /// sandbox-confined reader keeps those fields from naming arbitrary files on disk.
+    pub fn load_dockcraft_bundle_with(
+        &mut self,
+        bundle: DockCraftSceneBundle,
+        read_file: &dyn Fn(&Path) -> Result<Vec<u8>, String>,
     ) -> Result<String, ScriptError> {
         let rec_raw = if let Some(ref txt) = bundle.receptor_pdb_inline
             && !txt.trim().is_empty()
         {
             txt.clone()
         } else if let Some(ref p) = bundle.receptor_pdb_path {
-            std::fs::read_to_string(p)?
+            let bytes = read_file(Path::new(p)).map_err(ScriptError::Command)?;
+            String::from_utf8(bytes)
+                .map_err(|_| ScriptError::Command(format!("receptor file '{p}' is not UTF-8")))?
         } else {
             return Err(ScriptError::Command(
                 "DockCraftSceneBundle missing both receptor_pdb_inline and receptor_pdb_path"
@@ -511,10 +656,11 @@ impl BiomolSession {
             }
         }
 
-        // Optional binary DCD trajectory bundled from DockCraft MD validation
-        if let Some(ref dcd_p) = bundle.trajectory_dcd_path
-            && let Ok(bytes) = std::fs::read(dcd_p)
-        {
+        // Optional binary DCD trajectory bundled from DockCraft MD validation.
+        // A path the reader refuses is an error, not something to skip quietly: the caller
+        // asked for a trajectory and must learn it was not loaded.
+        if let Some(ref dcd_p) = bundle.trajectory_dcd_path {
+            let bytes = read_file(Path::new(dcd_p)).map_err(ScriptError::Command)?;
             let _ = load_dcd_frames(&mut rec, &bytes);
         }
 
@@ -1355,11 +1501,7 @@ impl BiomolSession {
     /// Execute one or more semicolon-separated PyMOL/ChimeraX-compatible DSL commands.
     pub fn execute_dsl(&mut self, script: &str) -> Result<String, ScriptError> {
         let mut responses = Vec::new();
-        for raw_stmt in script.split(';') {
-            let stmt = raw_stmt.trim();
-            if stmt.is_empty() || stmt.starts_with('#') {
-                continue;
-            }
+        for stmt in split_dsl_statements(script) {
             self.command_history.push(stmt.to_string());
             responses.push(self.execute_single_cmd(stmt)?);
         }
@@ -1367,9 +1509,12 @@ impl BiomolSession {
     }
 
     fn execute_single_cmd(&mut self, stmt: &str) -> Result<String, ScriptError> {
-        let mut parts = stmt.splitn(2, char::is_whitespace);
-        let cmd = parts.next().unwrap_or("").to_ascii_lowercase();
-        let rest = parts.next().unwrap_or("").trim();
+        let cmd = dsl_statement_verb(stmt);
+        let rest = stmt
+            .trim()
+            .split_once(char::is_whitespace)
+            .map_or("", |(_, tail)| tail)
+            .trim();
 
         match cmd.as_str() {
             "help" => Ok(render_registry_help(rest)),
@@ -3865,5 +4010,80 @@ $$$$
         let _ = std::fs::remove_file(&zip_path);
         let _ = std::fs::remove_dir_all(&push_dir);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sandbox_confinement_tests {
+    use super::*;
+
+    /// Aliases that `COMMAND_REGISTRY` advertises through `help`, `[TAB]` autocomplete and
+    /// the Ctrl+K palette, but that `execute_single_cmd` has no arm for: typing them gives
+    /// "unknown DSL command". They are classified as compute verbs so the capability tables
+    /// remain exhaustive; they are skipped below because the gap is in the interpreter, not
+    /// in the classification. Remove them from here once the interpreter accepts them.
+    const REGISTRY_ONLY_ALIASES: &[&str] = &["define_axis", "define_plane", "matchalign"];
+
+    /// The whitelist is only as good as its spelling: a typo would silently drop a verb,
+    /// and a verb the interpreter no longer has would rot there. Check both against the
+    /// interpreter itself rather than against the registry table.
+    #[test]
+    fn every_classified_verb_is_understood_by_the_interpreter() {
+        for verb in COMPUTE_VERBS
+            .iter()
+            .chain(FILESYSTEM_VERBS.iter())
+            .filter(|v| !REGISTRY_ONLY_ALIASES.contains(*v))
+        {
+            let mut sess = BiomolSession::default();
+            let err = sess
+                .execute_dsl(verb)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(
+                !err.contains("unknown DSL command"),
+                "verb '{verb}' is classified but the interpreter does not know it: {err}"
+            );
+        }
+    }
+
+    /// The lexer tricks that defeated the old substring blacklist, as reproduced in the audit.
+    #[test]
+    fn vetting_sees_statements_the_way_the_interpreter_does() {
+        // verb ends at ANY whitespace, not just a space
+        assert!(vet_dsl_for_sandbox("save\t/etc/x.pdb").is_err());
+        assert!(vet_dsl_for_sandbox("save\n/etc/x.pdb").is_err());
+        assert!(vet_dsl_for_sandbox("save\u{b}/etc/x.pdb").is_err());
+        // casing is normalised by the interpreter
+        assert!(vet_dsl_for_sandbox("SAVE /etc/x.pdb").is_err());
+        assert!(vet_dsl_for_sandbox("SaVe /etc/x.pdb").is_err());
+        // a statement hidden behind `;`, in any position
+        assert!(vet_dsl_for_sandbox("color mlp; save /etc/x.pdb").is_err());
+        assert!(vet_dsl_for_sandbox("save /etc/x.pdb; color mlp").is_err());
+        assert!(vet_dsl_for_sandbox("color mlp;;   save\t/etc/x.pdb  ;").is_err());
+        // leading whitespace and comment statements
+        assert!(vet_dsl_for_sandbox("   save /etc/x.pdb").is_err());
+        assert!(vet_dsl_for_sandbox("# save /etc/x.pdb").is_ok());
+        // aliases of filesystem verbs
+        for alias in ["pse", "cxs", "open_session", "load", "ray", "push"] {
+            assert!(
+                vet_dsl_for_sandbox(&format!("{alias} /etc/x")).is_err(),
+                "alias '{alias}' slipped through"
+            );
+        }
+        // unknown verbs fail closed
+        assert!(vet_dsl_for_sandbox("exfiltrate /etc/shadow").is_err());
+        // compute-only scripts still run
+        assert!(vet_dsl_for_sandbox("color mlp; hbonds 3.5; scene save f1").is_ok());
+    }
+
+    #[test]
+    fn the_splitter_and_the_verb_lexer_match_the_interpreter() {
+        assert_eq!(
+            split_dsl_statements(" color mlp ;; # note ; hbonds 3.5 "),
+            vec!["color mlp", "hbonds 3.5"]
+        );
+        assert_eq!(dsl_statement_verb("  SAVE\t/etc/x "), "save");
+        assert_eq!(dsl_statement_verb(""), "");
     }
 }

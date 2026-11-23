@@ -814,3 +814,201 @@ pub fn render_registry_help(filter: &str) -> String {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// Capability classification of DSL verbs (sandbox confinement)
+// ---------------------------------------------------------------------------
+//
+// The desktop app runs the DSL with the user's own file permissions, which is correct:
+// the user picked the paths. A remote MCP client did not, so the MCP server may only
+// expose verbs that cannot reach the filesystem or the network on their own.
+//
+// These two tables are the single source of truth for that split. `COMPUTE_VERBS` is a
+// whitelist: a verb is only callable by an untrusted client if it is listed here by name
+// or alias. Anything unlisted — including a verb added to the interpreter tomorrow — is
+// refused, so the failure mode of forgetting to classify a new command is "too strict".
+
+/// DSL verbs (canonical names and aliases) that read or write files, or hit the network,
+/// using paths taken straight from the command text.
+pub const FILESYSTEM_VERBS: &[&str] = &[
+    "open",
+    "load",
+    "fetch",
+    "save",
+    "save_session",
+    "pse",
+    "cxs",
+    "load_session",
+    "open_session",
+    "load_dock",
+    "load_dcd",
+    "open_map",
+    "pae",
+    "export_mesh",
+    "export_html",
+    "export_artcraft",
+    "push_artcraft",
+    "push",
+    "png",
+    "ray",
+    "movie",
+];
+
+/// DSL verbs (canonical names and aliases) that only touch in-memory session state:
+/// geometry, selections, colouring, camera, analysis and scientific modules.
+pub const COMPUTE_VERBS: &[&str] = &[
+    "help",
+    "models",
+    "active",
+    "hide",
+    "close",
+    "scene",
+    "clip",
+    "lighting",
+    "ssao",
+    "bg",
+    "background",
+    "preset",
+    "style",
+    "show",
+    "color",
+    "surface",
+    "silhouettes",
+    "waters",
+    "pose",
+    "gridbox",
+    "select",
+    "sele",
+    "mutate",
+    "minimize",
+    "align",
+    "module",
+    "rnafold",
+    "anm",
+    "gbsa",
+    "dipole",
+    "md",
+    "frame",
+    "tunnels",
+    "molmap",
+    "fitmap",
+    "denovo",
+    "putty",
+    "hbonds",
+    "clashes",
+    "contacts",
+    "distance",
+    "dist",
+    "angle",
+    "torsion",
+    "dihedral",
+    "measure",
+    "axis",
+    // Registry-only aliases: advertised by `help`/autocomplete but not yet implemented in
+    // the interpreter's command match. Classified as compute so the capability tables stay
+    // exhaustive; see REGISTRY_ONLY_ALIASES in the tests.
+    "define_axis",
+    "define_plane",
+    "matchalign",
+    "plane",
+    "label",
+    "2dlabel",
+    "2dlabels",
+    "key",
+    "scalebar",
+    "cealign",
+    "super",
+    "msa",
+    "morph",
+    "swapna",
+    "bond_rot",
+    "tug",
+    "sculpt",
+    "build",
+    "fab",
+    "addh",
+    "altlocs",
+    "renumber",
+    "changechains",
+    "combine",
+    "delete",
+    "sym",
+    "symexp",
+    "crystalcontacts",
+    "unitcell",
+    "snfg",
+    "glycans",
+    "vop",
+    "volume",
+    "undo",
+    "redo",
+    "reset",
+    "center",
+];
+
+/// Does this DSL verb reach the filesystem or the network by itself?
+///
+/// Case-insensitive, and accepts aliases (`pse` as well as `save_session`).
+#[must_use]
+pub fn verb_touches_filesystem(verb: &str) -> bool {
+    let low = verb.trim().to_ascii_lowercase();
+    FILESYSTEM_VERBS.contains(&low.as_str())
+}
+
+/// Is this DSL verb safe to expose to a caller confined to a `PathSandbox`?
+///
+/// Returns `false` for filesystem verbs **and** for anything unknown, so a newly added
+/// command is refused until somebody classifies it.
+#[must_use]
+pub fn verb_is_sandbox_safe(verb: &str) -> bool {
+    let low = verb.trim().to_ascii_lowercase();
+    !FILESYSTEM_VERBS.contains(&low.as_str()) && COMPUTE_VERBS.contains(&low.as_str())
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    /// Every verb in the registry must be classified exactly once. Adding a command to
+    /// `COMMAND_REGISTRY` without saying whether it touches the filesystem fails here.
+    #[test]
+    fn every_registry_command_and_alias_is_classified_exactly_once() {
+        for spec in COMMAND_REGISTRY {
+            for verb in std::iter::once(spec.name).chain(spec.aliases.iter().copied()) {
+                let fs = FILESYSTEM_VERBS.contains(&verb);
+                let compute = COMPUTE_VERBS.contains(&verb);
+                assert!(
+                    fs ^ compute,
+                    "DSL verb '{verb}' must be in exactly one of FILESYSTEM_VERBS / COMPUTE_VERBS (fs={fs}, compute={compute})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_capability_tables_are_lowercase_and_disjoint() {
+        for v in FILESYSTEM_VERBS.iter().chain(COMPUTE_VERBS.iter()) {
+            assert_eq!(*v, v.to_ascii_lowercase(), "verb '{v}' must be lowercase");
+        }
+        for v in FILESYSTEM_VERBS {
+            assert!(!COMPUTE_VERBS.contains(v), "verb '{v}' is in both tables");
+        }
+    }
+
+    #[test]
+    fn filesystem_verbs_are_never_sandbox_safe_whatever_the_casing() {
+        for v in FILESYSTEM_VERBS {
+            assert!(verb_touches_filesystem(v), "{v}");
+            assert!(verb_touches_filesystem(&v.to_ascii_uppercase()), "{v}");
+            assert!(!verb_is_sandbox_safe(v), "{v}");
+            assert!(!verb_is_sandbox_safe(&v.to_ascii_uppercase()), "{v}");
+        }
+    }
+
+    #[test]
+    fn unknown_verbs_are_refused_rather_than_assumed_harmless() {
+        for v in ["", "   ", "exfiltrate", "save_everything", "opened"] {
+            assert!(!verb_is_sandbox_safe(v), "unknown verb '{v}' was allowed");
+        }
+    }
+}

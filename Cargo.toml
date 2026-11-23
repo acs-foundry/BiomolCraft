@@ -40,11 +40,11 @@ unreachable = "deny"
 craft-mcp-server = { git = "https://github.com/storytold/craft-libs", rev = "52d2560c183b2df8b1ffc25ca2078683af146fd6" }
 
 # CraftBio shared libraries (public acs-foundry/craftbio-libs pinned tag)
-craftbio-sandbox = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v1.1.0" }
-craftbio-struct = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v1.1.0" }
-craftbio-scene = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v1.1.0" }
-craftbio-viewport = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v1.1.0" }
-craftbio-report = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v1.1.0" }
+craftbio-sandbox = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v1.1.1" }
+craftbio-struct = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v1.1.1" }
+craftbio-scene = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v1.1.1" }
+craftbio-viewport = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v1.1.1" }
+craftbio-report = { git = "https://github.com/acs-foundry/craftbio-libs", tag = "v1.1.1" }
 
 # Internal BiomolCraft biologics, modeling, physics & module crates (100% self-contained)
 bio-core = { path = "crates/bio-core" }
