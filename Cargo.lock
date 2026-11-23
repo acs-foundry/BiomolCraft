@@ -685,8 +685,8 @@ dependencies = [
 
 [[package]]
 name = "craftbio-report"
-version = "1.1.1"
-source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.1#3395910402dfd859723c4ace71fee67a9c8d2642"
+version = "1.1.2"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.2#65b1b0fd8be5d0ca429b45a01d00c38b9cf54cec"
 dependencies = [
  "serde",
  "serde_json",
@@ -694,8 +694,8 @@ dependencies = [
 
 [[package]]
 name = "craftbio-sandbox"
-version = "1.1.1"
-source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.1#3395910402dfd859723c4ace71fee67a9c8d2642"
+version = "1.1.2"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.2#65b1b0fd8be5d0ca429b45a01d00c38b9cf54cec"
 dependencies = [
  "rustix 1.1.6",
  "serde",
@@ -704,8 +704,8 @@ dependencies = [
 
 [[package]]
 name = "craftbio-scene"
-version = "1.1.1"
-source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.1#3395910402dfd859723c4ace71fee67a9c8d2642"
+version = "1.1.2"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.2#65b1b0fd8be5d0ca429b45a01d00c38b9cf54cec"
 dependencies = [
  "craft-ipc",
  "crc32fast",
@@ -717,8 +717,8 @@ dependencies = [
 
 [[package]]
 name = "craftbio-struct"
-version = "1.1.1"
-source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.1#3395910402dfd859723c4ace71fee67a9c8d2642"
+version = "1.1.2"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.2#65b1b0fd8be5d0ca429b45a01d00c38b9cf54cec"
 dependencies = [
  "rayon",
  "serde",
@@ -728,8 +728,8 @@ dependencies = [
 
 [[package]]
 name = "craftbio-viewport"
-version = "1.1.1"
-source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.1#3395910402dfd859723c4ace71fee67a9c8d2642"
+version = "1.1.2"
+source = "git+https://github.com/acs-foundry/craftbio-libs?tag=v1.1.2#65b1b0fd8be5d0ca429b45a01d00c38b9cf54cec"
 dependencies = [
  "bytemuck",
  "craftbio-scene",
