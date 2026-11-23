@@ -87,10 +87,6 @@ pub fn resolve_openmm_python() -> Option<PathBuf> {
     if candidate.is_file() {
         return Some(candidate);
     }
-    let fallback = PathBuf::from("/home/acs/Datos/CraftBio/envs/openmm/bin/python");
-    if fallback.is_file() {
-        return Some(fallback);
-    }
     None
 }
 
