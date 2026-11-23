@@ -6,7 +6,10 @@
 use std::path::Path;
 
 use biomol_rna::{analyze_ncrna_mrna, find_rna_preset};
-use biomol_script::{BiomolSession, decode_session_zip_bytes, encode_session_zip_bytes};
+use biomol_script::{
+    BiomolSession, decode_session_zip_bytes, dsl_statement_verb, encode_session_zip_bytes,
+    split_dsl_statements, vet_dsl_for_sandbox,
+};
 use craft_mcp_server::{
     Effect, Info, Options, Server, Tools, image_result, object, string, text_result, tool,
 };
@@ -22,7 +25,57 @@ pub struct BiomolTools {
     session: BiomolSession,
 }
 
+/// Characters allowed in a caller-supplied value that a typed tool interpolates into a
+/// DSL command. Everything that could change the *shape* of the command — whitespace,
+/// `;`, quotes, path separators — is excluded, so an argument can never become a verb.
+fn vet_dsl_argument(label: &str, raw: &str, extra: &str) -> Result<(), String> {
+    if raw.is_empty() {
+        return Err(format!("empty value for '{label}'"));
+    }
+    if let Some(bad) = raw
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && !extra.contains(*c))
+    {
+        return Err(format!(
+            "invalid character {bad:?} in '{label}' (value {raw:?}); \
+             expected only letters, digits and {extra:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Read a string argument and check it is safe to interpolate into a DSL command.
+fn dsl_arg<'a>(
+    args: &'a Value,
+    key: &str,
+    default: &'a str,
+    extra: &str,
+) -> Result<&'a str, String> {
+    let raw = args.get(key).and_then(Value::as_str).unwrap_or(default);
+    vet_dsl_argument(key, raw, extra)?;
+    Ok(raw)
+}
+
 impl BiomolTools {
+    /// Execute a DSL command that this server composed itself, refusing it unless every
+    /// statement carries one of the verbs the calling tool intends to run.
+    ///
+    /// Defence in depth behind [`vet_dsl_argument`]: even if a value slipped through
+    /// argument validation and smuggled in `"; save /etc/x"`, the extra verb is unexpected
+    /// here and the whole command is rejected before the interpreter sees it.
+    fn exec_typed(&mut self, cmd: &str, allowed: &[&str]) -> Result<String, String> {
+        for stmt in split_dsl_statements(cmd) {
+            let verb = dsl_statement_verb(stmt);
+            if !allowed.contains(&verb.as_str()) {
+                return Err(format!(
+                    "refused: composed command carries unexpected DSL verb '{verb}' \
+                     (expected one of {allowed:?}) — this indicates an injected argument"
+                ));
+            }
+        }
+        self.session.execute_dsl(cmd).map_err(|e| e.to_string())
+    }
+
     #[must_use]
     pub fn new(sandbox: PathSandbox) -> Self {
         Self {
@@ -403,17 +456,12 @@ impl Tools for BiomolTools {
             }
             "run_dsl" => {
                 let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
-                // Reject raw file-system open/save/png inside generic DSL to preserve sandbox confinement
-                let lower = cmd.to_ascii_lowercase();
-                if lower.contains("open ")
-                    || lower.contains("load ")
-                    || lower.contains("save ")
-                    || lower.contains("png ")
-                {
-                    return text_result(
-                        "use dedicated sandboxed tools `load_biomolecule`, `save_structure_or_scene`, or `render_view_png` for file I/O",
-                        true,
-                    );
+                // Confinement: vet every statement with the interpreter's own lexer and a
+                // whitelist of verbs that cannot reach the filesystem. A substring blacklist
+                // was not enough — the verb ends at any whitespace, casing is normalised by
+                // the interpreter, and `;` starts a statement the blacklist never inspected.
+                if let Err(why) = vet_dsl_for_sandbox(cmd) {
+                    return text_result(why.to_string(), true);
                 }
                 match self.session.execute_dsl(cmd) {
                     Ok(out) => text_result(out, false),
@@ -421,32 +469,37 @@ impl Tools for BiomolTools {
                 }
             }
             "mutate_residue_3d" => {
-                let ch = args.get("chain").and_then(Value::as_str).unwrap_or("A");
+                let (ch, aa) = match (
+                    dsl_arg(args, "chain", "A", ""),
+                    dsl_arg(args, "target_aa", "A", ""),
+                ) {
+                    (Ok(c), Ok(a)) => (c, a),
+                    (Err(e), _) | (_, Err(e)) => return text_result(e, true),
+                };
                 let rseq = args.get("res_seq").and_then(Value::as_i64).unwrap_or(1);
-                let aa = args.get("target_aa").and_then(Value::as_str).unwrap_or("A");
                 let cmd = if let Some(rot) = args.get("rotamer").and_then(Value::as_u64) {
                     format!("mutate {ch}:{rseq} {aa} {rot}")
                 } else {
                     format!("mutate {ch}:{rseq} {aa}")
                 };
-                match self.session.execute_dsl(&cmd) {
+                match self.exec_typed(&cmd, &["mutate"]) {
                     Ok(msg) => text_result(msg, false),
-                    Err(e) => text_result(e.to_string(), true),
+                    Err(e) => text_result(e, true),
                 }
             }
             "minimize_local" => {
                 let steps = args.get("steps").and_then(Value::as_u64).unwrap_or(80);
-                match self.session.execute_dsl(&format!("minimize {steps}")) {
+                match self.exec_typed(&format!("minimize {steps}"), &["minimize"]) {
                     Ok(msg) => text_result(msg, false),
                     Err(e) => text_result(e.to_string(), true),
                 }
             }
             "run_biomol_module" => {
-                let m = args
-                    .get("module")
-                    .and_then(Value::as_str)
-                    .unwrap_or("antibodies");
-                match self.session.execute_dsl(&format!("module {m}")) {
+                let m = match dsl_arg(args, "module", "antibodies", "_-") {
+                    Ok(v) => v,
+                    Err(e) => return text_result(e, true),
+                };
+                match self.exec_typed(&format!("module {m}"), &["module"]) {
                     Ok(msg) => text_result(
                         format!("{msg}\n\n{}", self.session.last_module_markdown),
                         false,
@@ -535,7 +588,7 @@ impl Tools for BiomolTools {
                     .get("amplitude_a")
                     .and_then(Value::as_f64)
                     .unwrap_or(2.2);
-                match self.session.execute_dsl(&format!("anm {m} {amp:.2}")) {
+                match self.exec_typed(&format!("anm {m} {amp:.2}"), &["anm"]) {
                     Ok(msg) => text_result(
                         format!("{msg}\n\n{}", self.session.last_module_markdown),
                         false,
@@ -543,14 +596,14 @@ impl Tools for BiomolTools {
                     Err(e) => text_result(e.to_string(), true),
                 }
             }
-            "run_gbsa_physics" => match self.session.execute_dsl("gbsa") {
+            "run_gbsa_physics" => match self.exec_typed("gbsa", &["gbsa"]) {
                 Ok(msg) => text_result(
                     format!("{msg}\n\n{}", self.session.last_module_markdown),
                     false,
                 ),
                 Err(e) => text_result(e.to_string(), true),
             },
-            "run_enzyme_engineering" => match self.session.execute_dsl("tunnels") {
+            "run_enzyme_engineering" => match self.exec_typed("tunnels", &["tunnels"]) {
                 Ok(msg) => text_result(
                     format!("{msg}\n\n{}", self.session.last_module_markdown),
                     false,
@@ -563,10 +616,7 @@ impl Tools for BiomolTools {
                     .and_then(Value::as_f64)
                     .unwrap_or(4.5);
                 let sig = args.get("sigma").and_then(Value::as_f64).unwrap_or(1.5);
-                match self
-                    .session
-                    .execute_dsl(&format!("molmap {res:.1} {sig:.1}"))
-                {
+                match self.exec_typed(&format!("molmap {res:.1} {sig:.1}"), &["molmap"]) {
                     Ok(msg) => text_result(
                         format!("{msg}\n\n{}", self.session.last_module_markdown),
                         false,
@@ -575,14 +625,21 @@ impl Tools for BiomolTools {
                 }
             }
             "stage_denovo_binder" => {
-                let ch = args.get("chain").and_then(Value::as_str).unwrap_or("C");
+                let ch = match dsl_arg(args, "chain", "C", "") {
+                    Ok(v) => v,
+                    Err(e) => return text_result(e, true),
+                };
                 let hs = args.get("hotspots").and_then(Value::as_str).unwrap_or("");
                 let cmd = if hs.trim().is_empty() {
                     format!("denovo {ch}")
                 } else {
+                    // hotspot residue list, e.g. "12,15,18"
+                    if let Err(e) = vet_dsl_argument("hotspots", hs, ",") {
+                        return text_result(e, true);
+                    }
                     format!("denovo {ch} {hs}")
                 };
-                match self.session.execute_dsl(&cmd) {
+                match self.exec_typed(&cmd, &["denovo"]) {
                     Ok(msg) => text_result(
                         format!("{msg}\n\n{}", self.session.last_module_markdown),
                         false,
@@ -622,20 +679,32 @@ impl Tools for BiomolTools {
                 match self.sandbox.read_string(Path::new(p)) {
                     Ok(raw) => {
                         match serde_json::from_str::<craftbio_scene::DockCraftSceneBundle>(&raw) {
-                            Ok(bundle) => match self.session.load_dockcraft_bundle(bundle) {
-                                Ok(mut msg) => {
-                                    if let Some(pose_idx) = args.get("pose").and_then(Value::as_u64)
-                                        && pose_idx > 0
-                                        && let Ok(pm) =
-                                            self.session.select_dock_pose(pose_idx as usize)
-                                    {
-                                        msg.push('\n');
-                                        msg.push_str(&pm);
+                            // The bundle's own `receptor_pdb_path` / `trajectory_dcd_path`
+                            // are attacker-controlled: resolve them through the sandbox
+                            // rather than with `std::fs`.
+                            Ok(bundle) => {
+                                let Self { sandbox, session } = self;
+                                let confined = |fp: &Path| {
+                                    sandbox
+                                        .read_bytes(fp)
+                                        .map_err(|e| format!("sandbox read rejected: {e}"))
+                                };
+                                match session.load_dockcraft_bundle_with(bundle, &confined) {
+                                    Ok(mut msg) => {
+                                        if let Some(pose_idx) =
+                                            args.get("pose").and_then(Value::as_u64)
+                                            && pose_idx > 0
+                                            && let Ok(pm) =
+                                                session.select_dock_pose(pose_idx as usize)
+                                        {
+                                            msg.push('\n');
+                                            msg.push_str(&pm);
+                                        }
+                                        text_result(msg, false)
                                     }
-                                    text_result(msg, false)
+                                    Err(e) => text_result(e.to_string(), true),
                                 }
-                                Err(e) => text_result(e.to_string(), true),
-                            },
+                            }
                             Err(e) => {
                                 text_result(format!("invalid DockCraftSceneBundle JSON: {e}"), true)
                             }
@@ -671,16 +740,21 @@ impl Tools for BiomolTools {
                 }
             }
             "manage_scene" => {
-                let act = args.get("action").and_then(Value::as_str).unwrap_or("list");
-                let nm = args.get("name").and_then(Value::as_str).unwrap_or("f1");
+                let (act, nm) = match (
+                    dsl_arg(args, "action", "list", ""),
+                    dsl_arg(args, "name", "f1", "_-"),
+                ) {
+                    (Ok(a), Ok(n)) => (a, n),
+                    (Err(e), _) | (_, Err(e)) => return text_result(e, true),
+                };
                 let cmd = if act.eq_ignore_ascii_case("list") {
                     "scene list".to_string()
                 } else {
                     format!("scene {act} {nm}")
                 };
-                match self.session.execute_dsl(&cmd) {
+                match self.exec_typed(&cmd, &["scene"]) {
                     Ok(msg) => text_result(msg, false),
-                    Err(e) => text_result(e.to_string(), true),
+                    Err(e) => text_result(e, true),
                 }
             }
             "analyze_interactions" => {
@@ -697,7 +771,10 @@ impl Tools for BiomolTools {
                 if putty {
                     cmd.push_str("; putty on; key plddt; scalebar 20");
                 }
-                match self.session.execute_dsl(&cmd) {
+                match self.exec_typed(
+                    &cmd,
+                    &["hbonds", "clashes", "contacts", "putty", "key", "scalebar"],
+                ) {
                     Ok(msg) => text_result(
                         format!("{msg}\n\n{}", self.session.last_module_markdown),
                         false,
@@ -706,14 +783,13 @@ impl Tools for BiomolTools {
                 }
             }
             "cealign_models" => {
-                let mc = args
-                    .get("mobile_chain")
-                    .and_then(Value::as_str)
-                    .unwrap_or("A");
-                let tc = args
-                    .get("target_chain")
-                    .and_then(Value::as_str)
-                    .unwrap_or("A");
+                let (mc, tc) = match (
+                    dsl_arg(args, "mobile_chain", "A", ""),
+                    dsl_arg(args, "target_chain", "A", ""),
+                ) {
+                    (Ok(m), Ok(t)) => (m, t),
+                    (Err(e), _) | (_, Err(e)) => return text_result(e, true),
+                };
                 if let Some(p) = args.get("mobile_path").and_then(Value::as_str)
                     && !p.is_empty()
                 {
@@ -740,9 +816,9 @@ impl Tools for BiomolTools {
                 } else {
                     format!("cealign {mc} {tc}")
                 };
-                match self.session.execute_dsl(&cmd) {
+                match self.exec_typed(&cmd, &["cealign"]) {
                     Ok(msg) => text_result(msg, false),
-                    Err(e) => text_result(e.to_string(), true),
+                    Err(e) => text_result(e, true),
                 }
             }
             "morph_structures" => {
@@ -770,8 +846,7 @@ impl Tools for BiomolTools {
                         let a_id = self.session.models[0].model_id;
                         let b_id = self.session.models.last().map_or(2, |m| m.model_id);
                         match self
-                            .session
-                            .execute_dsl(&format!("morph #{a_id} #{b_id} {frames}"))
+                            .exec_typed(&format!("morph #{a_id} #{b_id} {frames}"), &["morph"])
                         {
                             Ok(msg) => text_result(msg, false),
                             Err(e) => text_result(e.to_string(), true),
@@ -781,7 +856,10 @@ impl Tools for BiomolTools {
                 }
             }
             "render_movie" => {
-                let mode = args.get("mode").and_then(Value::as_str).unwrap_or("turn");
+                let mode = match dsl_arg(args, "mode", "turn", "") {
+                    Ok(v) => v,
+                    Err(e) => return text_result(e, true),
+                };
                 let out = args.get("out_path").and_then(Value::as_str).unwrap_or("");
                 let frames = args
                     .get("frames")
@@ -806,47 +884,56 @@ impl Tools for BiomolTools {
                 // Enforce sandbox write confinement via zero-byte preflight creation
                 match self.sandbox.write_bytes(Path::new(out), &[]) {
                     Ok(safe_path) => {
+                        // `movie` is a filesystem verb, allowed here only because the path
+                        // was resolved and created by the sandbox a moment ago, not by the
+                        // caller. `exec_typed` still refuses any extra statement.
                         let cmd = format!(
                             "movie {mode} {} {frames} {w} {h} {fps}",
                             safe_path.display()
                         );
-                        match self.session.execute_dsl(&cmd) {
+                        match self.exec_typed(&cmd, &["movie"]) {
                             Ok(msg) => text_result(msg, false),
-                            Err(e) => text_result(e.to_string(), true),
+                            Err(e) => text_result(e, true),
                         }
                     }
                     Err(e) => text_result(format!("sandbox write rejected: {e}"), true),
                 }
             }
             "swapna_nucleotide" => {
-                let ch = args.get("chain").and_then(Value::as_str).unwrap_or("A");
+                let (ch, base) = match (
+                    dsl_arg(args, "chain", "A", ""),
+                    dsl_arg(args, "target_base", "A", ""),
+                ) {
+                    (Ok(c), Ok(b)) => (c, b),
+                    (Err(e), _) | (_, Err(e)) => return text_result(e, true),
+                };
                 let rseq = args.get("res_seq").and_then(Value::as_i64).unwrap_or(1);
-                let base = args
-                    .get("target_base")
-                    .and_then(Value::as_str)
-                    .unwrap_or("A");
-                match self
-                    .session
-                    .execute_dsl(&format!("swapna {ch}:{rseq} {base}"))
-                {
+                match self.exec_typed(&format!("swapna {ch}:{rseq} {base}"), &["swapna"]) {
                     Ok(msg) => text_result(msg, false),
-                    Err(e) => text_result(e.to_string(), true),
+                    Err(e) => text_result(e, true),
                 }
             }
             "build_structure_3d" => {
-                let kind = args.get("kind").and_then(Value::as_str).unwrap_or("helix");
-                let seq = args.get("sequence").and_then(Value::as_str).unwrap_or("");
-                let ch = args.get("chain").and_then(Value::as_str).unwrap_or("A");
-                match self
-                    .session
-                    .execute_dsl(&format!("build {kind} {seq} {ch}"))
-                {
+                let (kind, seq, ch) = match (
+                    dsl_arg(args, "kind", "helix", "_-"),
+                    dsl_arg(args, "sequence", "", ""),
+                    dsl_arg(args, "chain", "A", ""),
+                ) {
+                    (Ok(k), Ok(s), Ok(c)) => (k, s, c),
+                    (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                        return text_result(e, true);
+                    }
+                };
+                match self.exec_typed(&format!("build {kind} {seq} {ch}"), &["build"]) {
                     Ok(msg) => text_result(msg, false),
-                    Err(e) => text_result(e.to_string(), true),
+                    Err(e) => text_result(e, true),
                 }
             }
             "symmetry_and_glycans" => {
-                let act = args.get("action").and_then(Value::as_str).unwrap_or("snfg");
+                let act = match dsl_arg(args, "action", "snfg", "_-") {
+                    Ok(v) => v,
+                    Err(e) => return text_result(e, true),
+                };
                 let cut = args.get("cutoff_a").and_then(Value::as_f64).unwrap_or(5.0);
                 let cmd = match act.to_ascii_lowercase().as_str() {
                     "sym" => "sym".to_string(),
@@ -855,7 +942,10 @@ impl Tools for BiomolTools {
                     "unitcell" => "unitcell on".to_string(),
                     _ => "snfg on".to_string(),
                 };
-                match self.session.execute_dsl(&cmd) {
+                match self.exec_typed(
+                    &cmd,
+                    &["sym", "symexp", "crystalcontacts", "unitcell", "snfg"],
+                ) {
                     Ok(msg) => text_result(
                         format!("{msg}\n\n{}", self.session.last_module_markdown),
                         false,
@@ -864,16 +954,19 @@ impl Tools for BiomolTools {
                 }
             }
             "volume_operations_vop" => {
-                let op = args.get("op").and_then(Value::as_str).unwrap_or("sharpen");
+                let op = match dsl_arg(args, "op", "sharpen", "_-") {
+                    Ok(v) => v,
+                    Err(e) => return text_result(e, true),
+                };
                 let param = args.get("param").and_then(Value::as_f64).unwrap_or(1.5);
                 let cmd = if op.eq_ignore_ascii_case("orthoplanes") {
                     "vop orthoplanes on".to_string()
                 } else {
                     format!("vop {op} {param:.2}")
                 };
-                match self.session.execute_dsl(&cmd) {
+                match self.exec_typed(&cmd, &["vop"]) {
                     Ok(msg) => text_result(msg, false),
-                    Err(e) => text_result(e.to_string(), true),
+                    Err(e) => text_result(e, true),
                 }
             }
             "save_biomol_session" => {
@@ -987,6 +1080,7 @@ pub fn run_mcp_stdio(sandbox: PathSandbox) -> Result<(), String> {
 mod tests {
     use super::*;
     use craftbio_sandbox::DEFAULT_MAX_FILE_BYTES;
+    use std::path::PathBuf;
 
     #[test]
     fn craft_mcp_server_lists_8_tools_folds_rna_and_blocks_traversal()
@@ -1050,6 +1144,403 @@ mod tests {
         assert!(esc.contains("\"isError\":true"));
 
         let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    /// Build an isolated server plus a directory that lies OUTSIDE both sandbox roots.
+    fn escape_fixture(
+        tag: &str,
+    ) -> Result<(Server<BiomolTools>, PathBuf), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("biomol_esc_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let inside = root.join("inside");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&inside)?;
+        std::fs::create_dir_all(&outside)?;
+        let sbx = PathSandbox::new(Some(inside.clone()), Some(inside), DEFAULT_MAX_FILE_BYTES)?;
+        let info = Info {
+            name: "biomolcraft-mcp",
+            title: "BiomolCraft MCP",
+            version: "0.1.0",
+            max_line: 1024 * 1024,
+        };
+        let mut srv = Server::new(info, BiomolTools::new(sbx)).with_options(Options {
+            tool_errors_as_results: true,
+            ..Options::default()
+        });
+        srv.handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#)
+            .ok_or("no init reply")?;
+        srv.handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"build_structure_3d","arguments":{"kind":"helix","sequence":"AKLTYW","chain":"A"}}}"#)
+            .ok_or("no build reply")?;
+        Ok((srv, outside))
+    }
+
+    fn call_tool(srv: &mut Server<BiomolTools>, tool_name: &str, arguments: &Value) -> String {
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "tools/call",
+            "params": { "name": tool_name, "arguments": arguments },
+        });
+        srv.handle_line(&req.to_string()).unwrap_or_default()
+    }
+
+    /// Audit finding F3-01: `run_dsl` confined itself with a substring blacklist
+    /// (`"open "`, `"load "`, `"save "`, `"png "`), which the DSL lexer walks straight past:
+    /// it splits the verb on ANY whitespace, lowercases it, and splits statements on `;`.
+    /// Every payload below escaped `--write-root` / `--read-root` before the fix.
+    #[test]
+    fn run_dsl_cannot_reach_the_filesystem_outside_the_sandbox()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut srv, outside) = escape_fixture("rundsl")?;
+
+        // (verb reached via a lexer quirk, file it tried to touch)
+        let payloads: Vec<(String, PathBuf)> = vec![
+            // tab instead of space defeats `contains("save ")`
+            (
+                format!("save\t{}", outside.join("tab.pdb").display()),
+                outside.join("tab.pdb"),
+            ),
+            // uppercase defeats the lowercased-haystack check on the raw string
+            (
+                format!("SAVE {}", outside.join("upper.pdb").display()),
+                outside.join("upper.pdb"),
+            ),
+            // a second statement after `;` was never inspected as a verb
+            (
+                format!("color mlp; save {}", outside.join("semi.pdb").display()),
+                outside.join("semi.pdb"),
+            ),
+            // leading whitespace inside the statement
+            (
+                format!("  save  {}", outside.join("lead.pdb").display()),
+                outside.join("lead.pdb"),
+            ),
+            // verbs the blacklist never named at all
+            (
+                format!("export_mesh {}", outside.join("mesh.obj").display()),
+                outside.join("mesh.obj"),
+            ),
+            (
+                format!("export_html {}", outside.join("dossier.html").display()),
+                outside.join("dossier.html"),
+            ),
+            (
+                format!("save_session {}", outside.join("sess.biomol.zip").display()),
+                outside.join("sess.biomol.zip"),
+            ),
+            (
+                format!("png {}", outside.join("shot.png").display()),
+                outside.join("shot.png"),
+            ),
+            (
+                format!("ray {}", outside.join("ray.png").display()),
+                outside.join("ray.png"),
+            ),
+            (
+                format!("movie turn {} 4 64 64 4", outside.join("mov.gif").display()),
+                outside.join("mov.gif"),
+            ),
+            (
+                format!("export_artcraft {}", outside.join("bundle").display()),
+                outside.join("bundle"),
+            ),
+            (
+                format!("push wordcraft {}", outside.join("push").display()),
+                outside.join("push"),
+            ),
+        ];
+
+        for (cmd, must_not_exist) in payloads {
+            let reply = call_tool(&mut srv, "run_dsl", &json!({ "command": cmd }));
+            assert!(
+                reply.contains("\"isError\":true"),
+                "run_dsl accepted a filesystem verb: {cmd}\nreply: {reply}"
+            );
+            assert!(
+                !must_not_exist.exists(),
+                "run_dsl wrote outside the sandbox: {}",
+                must_not_exist.display()
+            );
+        }
+
+        // Reads must be refused too, and must not leak file contents into the reply.
+        let read_back = call_tool(
+            &mut srv,
+            "run_dsl",
+            &json!({ "command": "open\t/etc/hostname" }),
+        );
+        assert!(read_back.contains("\"isError\":true"), "{read_back}");
+
+        // ...while compute-only verbs keep working: the guard is a whitelist, not a ban on
+        // `run_dsl`. A command may still fail on its own scientific merits (no BIOMT records,
+        // nothing selected); what it must never do is trip the confinement guard.
+        for ok_cmd in [
+            "color mlp",
+            "hbonds 3.5; contacts 4.0",
+            "minimize 2",
+            "select name CA",
+            "sym",
+            "scene save f1",
+        ] {
+            let reply = call_tool(&mut srv, "run_dsl", &json!({ "command": ok_cmd }));
+            assert!(
+                !reply.contains("not available over MCP") && !reply.contains("whitelist"),
+                "guard rejected a sandbox-safe command '{ok_cmd}': {reply}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(outside.parent().unwrap_or(&outside));
+        Ok(())
+    }
+
+    /// Audit finding F3-02: the typed tools interpolate caller-controlled strings into a DSL
+    /// command with `format!`, and `execute_dsl` splits on `;`. A single argument carrying
+    /// `"; save <path>"` appended a whole new command that the sandbox never saw.
+    #[test]
+    fn typed_tools_do_not_let_arguments_smuggle_a_second_dsl_command()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut srv, outside) = escape_fixture("inject")?;
+        let p = |n: &str| outside.join(n);
+        let s = |n: &str| format!("; save {}", p(n).display());
+
+        let cases: Vec<(&str, Value, PathBuf)> = vec![
+            (
+                "mutate_residue_3d",
+                json!({"chain": "A", "res_seq": 1, "target_aa": format!("G{}", s("mut.pdb"))}),
+                p("mut.pdb"),
+            ),
+            (
+                "mutate_residue_3d",
+                json!({"chain": format!("A{}", s("mutchain.pdb")), "res_seq": 1, "target_aa": "G"}),
+                p("mutchain.pdb"),
+            ),
+            (
+                "run_biomol_module",
+                json!({"module": format!("antibodies{}", s("mod.pdb"))}),
+                p("mod.pdb"),
+            ),
+            (
+                "stage_denovo_binder",
+                json!({"chain": "C", "hotspots": format!("12,15{}", s("denovo.pdb"))}),
+                p("denovo.pdb"),
+            ),
+            (
+                "manage_scene",
+                json!({"action": "save", "name": format!("f1{}", s("scene.pdb"))}),
+                p("scene.pdb"),
+            ),
+            (
+                "cealign_models",
+                json!({"mobile_chain": format!("A{}", s("cealign.pdb")), "target_chain": "A"}),
+                p("cealign.pdb"),
+            ),
+            (
+                "render_movie",
+                json!({"mode": format!("turn{}", s("movie.pdb")), "out_path": "ok.gif"}),
+                p("movie.pdb"),
+            ),
+            (
+                "swapna_nucleotide",
+                json!({"chain": "A", "res_seq": 1, "target_base": format!("G{}", s("swap.pdb"))}),
+                p("swap.pdb"),
+            ),
+            (
+                "build_structure_3d",
+                json!({"kind": "helix", "sequence": format!("AK{}", s("build.pdb")), "chain": "A"}),
+                p("build.pdb"),
+            ),
+            (
+                "build_structure_3d",
+                json!({"kind": format!("helix{}", s("buildkind.pdb")), "sequence": "AK", "chain": "A"}),
+                p("buildkind.pdb"),
+            ),
+            (
+                "volume_operations_vop",
+                json!({"op": format!("sharpen{}", s("vop.pdb")), "param": 1.5}),
+                p("vop.pdb"),
+            ),
+            (
+                "symmetry_and_glycans",
+                json!({"action": format!("sym{}", s("sym.pdb")), "cutoff_a": 5.0}),
+                p("sym.pdb"),
+            ),
+        ];
+
+        for (tool_name, arguments, must_not_exist) in cases {
+            let reply = call_tool(&mut srv, tool_name, &arguments);
+            assert!(
+                !must_not_exist.exists(),
+                "{tool_name} smuggled a second DSL command and wrote {}\nargs: {arguments}\nreply: {reply}",
+                must_not_exist.display()
+            );
+            assert!(
+                reply.contains("\"isError\":true"),
+                "{tool_name} silently accepted an injected argument\nargs: {arguments}\nreply: {reply}"
+            );
+        }
+
+        // The same tools must still work with honest arguments.
+        let ok = call_tool(
+            &mut srv,
+            "manage_scene",
+            &json!({"action": "save", "name": "f1"}),
+        );
+        assert!(!ok.contains("\"isError\":true"), "{ok}");
+        let ok = call_tool(
+            &mut srv,
+            "mutate_residue_3d",
+            &json!({"chain": "A", "res_seq": 1, "target_aa": "G"}),
+        );
+        assert!(!ok.contains("\"isError\":true"), "{ok}");
+
+        let _ = std::fs::remove_dir_all(outside.parent().unwrap_or(&outside));
+        Ok(())
+    }
+
+    /// Audit finding F3-03: `load_dockcraft_bundle` deserialised a caller-supplied JSON and
+    /// then read `receptor_pdb_path` / `trajectory_dcd_path` with `std::fs`, so the bundle
+    /// itself could name any file on disk. The content then sat in the session, ready to be
+    /// written back inside the sandbox by `save_structure_or_scene` — a read primitive
+    /// turned into exfiltration.
+    #[test]
+    fn a_dockcraft_bundle_cannot_name_files_outside_the_sandbox()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut srv, outside) = escape_fixture("bundle")?;
+        let root = outside.parent().map_or(outside.clone(), Path::to_path_buf);
+        let inside = root.join("inside");
+
+        // A file the MCP client must never be able to read.
+        let secret = outside.join("secret.pdb");
+        std::fs::write(
+            &secret,
+            "ATOM      1  CA  SEC A   1       9.000   9.000   9.000  1.00 99.00           C\nEND\n",
+        )?;
+
+        let bundle = |extra: Value| {
+            let mut b = json!({
+                "schema_version": "dockcraft-bundle/v1",
+                "title": "audit",
+                "source_app": "audit",
+                "receptor_name": "rec",
+                "receptor_pdb_path": null,
+                "receptor_pdb_inline": null,
+                "grid_box": null,
+                "trajectory_dcd_path": null,
+            });
+            if let (Some(obj), Some(ex)) = (b.as_object_mut(), extra.as_object()) {
+                for (k, v) in ex {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            b
+        };
+
+        let inline_ok =
+            "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 20.00           C\nEND\n";
+
+        let cases: Vec<(&str, Value)> = vec![
+            // receptor read straight from an absolute path outside the sandbox
+            (
+                "receptor_pdb_path absolute",
+                bundle(json!({ "receptor_pdb_path": secret.display().to_string() })),
+            ),
+            // ...and via traversal from inside it
+            (
+                "receptor_pdb_path traversal",
+                bundle(json!({ "receptor_pdb_path": "../outside/secret.pdb" })),
+            ),
+            // trajectory path is read too, even when the receptor is inline and honest
+            (
+                "trajectory_dcd_path",
+                bundle(json!({
+                    "receptor_pdb_inline": inline_ok,
+                    "trajectory_dcd_path": secret.display().to_string(),
+                })),
+            ),
+        ];
+
+        for (label, body) in cases {
+            let path = inside.join("b.dockbundle.json");
+            std::fs::write(&path, serde_json::to_string(&body)?)?;
+            let reply = call_tool(
+                &mut srv,
+                "load_dockcraft_bundle",
+                &json!({ "path": "b.dockbundle.json" }),
+            );
+            assert!(
+                reply.contains("\"isError\":true"),
+                "{label}: bundle naming a file outside the sandbox was accepted: {reply}"
+            );
+
+            // And the secret must not have reached the session: saving back inside the
+            // sandbox must not hand the caller the file it was never allowed to read.
+            let saved = call_tool(
+                &mut srv,
+                "save_structure_or_scene",
+                &json!({ "out_path": "leak.pdb" }),
+            );
+            let leaked = inside.join("leak.pdb");
+            if leaked.exists() {
+                let text = std::fs::read_to_string(&leaked)?;
+                assert!(
+                    !text.contains("SEC"),
+                    "{label}: content of a file outside the sandbox was exfiltrated via {saved}"
+                );
+                let _ = std::fs::remove_file(&leaked);
+            }
+        }
+
+        // An honest bundle, fully inline, still loads.
+        let good = bundle(json!({ "receptor_pdb_inline": inline_ok }));
+        std::fs::write(
+            inside.join("good.dockbundle.json"),
+            serde_json::to_string(&good)?,
+        )?;
+        let reply = call_tool(
+            &mut srv,
+            "load_dockcraft_bundle",
+            &json!({ "path": "good.dockbundle.json" }),
+        );
+        assert!(!reply.contains("\"isError\":true"), "{reply}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// Audit finding F3-04: `select`/`delete` reach `evaluate_selection`, whose parser
+    /// recurses once per prefix operator. 20 000 nested parentheses aborted the whole
+    /// server (exit 134) — a stack overflow, which `catch_unwind` could not have caught
+    /// either. The MCP server must refuse such an expression before parsing it.
+    #[test]
+    fn deeply_nested_selection_expressions_are_refused_not_fatal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut srv, outside) = escape_fixture("nesting")?;
+
+        for cmd in [
+            format!("select {}name CA{}", "(".repeat(20_000), ")".repeat(20_000)),
+            format!("select {}name CA", "not ".repeat(20_000)),
+            format!("delete {}name CA{}", "(".repeat(20_000), ")".repeat(20_000)),
+        ] {
+            let reply = call_tool(&mut srv, "run_dsl", &json!({ "command": cmd }));
+            assert!(
+                reply.contains("\"isError\":true"),
+                "deep nesting was accepted instead of refused: {}",
+                &reply[..reply.len().min(200)]
+            );
+        }
+
+        // The server is still alive and ordinary selections still work.
+        let reply = call_tool(&mut srv, "run_dsl", &json!({ "command": "select name CA" }));
+        assert!(!reply.contains("\"isError\":true"), "{reply}");
+        let reply = call_tool(
+            &mut srv,
+            "run_dsl",
+            &json!({ "command": "select (name CA or name CB) and not water" }),
+        );
+        assert!(!reply.contains("\"isError\":true"), "{reply}");
+
+        let _ = std::fs::remove_dir_all(outside.parent().unwrap_or(&outside));
         Ok(())
     }
 }

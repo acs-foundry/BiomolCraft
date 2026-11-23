@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 //! `biomol-rna` — First-Class **ncRNA, mRNA, siRNA, ASO & Riboswitch** Engineering Module:
-//! - Deterministic Zuker / Turner-2004 MFE 2D RNA Secondary Structure Folding (`fold_rna_mfe`)
+//! - Deterministic Zuker-style MFE 2D RNA Secondary Structure Folding (`fold_rna_mfe`) over an
+//!   **in-house stacking model**, not the Turner-2004 parameter set: see `stack_energy`.
 //! - Structural Motifs (G-Quadruplex, Hairpins, Stems, AU-Rich Elements, TLR7/8 Motifs)
 //! - Therapeutic mRNA Audit (`5'-UTR` ribosome accessibility, Kozak, U% / `m1Ψ`, LNP molar ratios)
 //! - 2D Predicted vs 3D Crystal Base-Pair Concordance & XSS-Safe SVG Arc Diagram
@@ -168,8 +169,19 @@ fn can_pair(a: char, b: char) -> bool {
     )
 }
 
-/// Turner-2004-inspired stacking energy (kcal/mol, negative = stabilizing) for nested pair `(i, j)`
-/// stacked on `(i+1, j-1)`.
+/// In-house stacking energy (kcal/mol, negative = stabilizing) for nested pair `(i, j)` stacked on
+/// `(i+1, j-1)`.
+///
+/// **This is not the Turner-2004 nearest-neighbour model and its numbers are not comparable with
+/// those of RNAfold/ViennaRNA.** Turner assigns a different energy to each *dinucleotide step* and
+/// to its orientation (5'GC3'/3'CG5' = -3.42 vs 5'CG3'/3'GC5' = -2.36 kcal/mol); the model here is
+/// additive over the two base pairs and orientation-independent, so both of those steps score the
+/// same -3.97. It is also systematically more stabilizing: a GG/CC stack gives -3.97 against the
+/// published -3.26, about 22% more, and the difference compounds along a helix.
+///
+/// Structures predicted from it are often reasonable; the kcal/mol values are an internal scale.
+/// If a comparison with published MFE values is ever needed, the parameter table has to be
+/// replaced by the real 4x4 Turner set first.
 fn stack_energy(a: char, b: char, inner_a: char, inner_b: char) -> f64 {
     let base_val = |x: char, y: char| -> f64 {
         match (x, y) {
@@ -199,8 +211,11 @@ fn pair_init_energy(a: char, b: char) -> f64 {
     }
 }
 
-/// Exact deterministic Zuker-style MFE 2D RNA folding (minimizing free energy `ΔG` in kcal/mol
-/// with `min_hairpin = 3`, Turner-calibrated stacking & loop penalties).
+/// Deterministic Zuker-style MFE 2D RNA folding with `min_hairpin = 3`.
+///
+/// The dynamic programme is the standard one; the energies it minimises come from the in-house
+/// model in `stack_energy`, **not** from the Turner-2004 tables, and are therefore not comparable
+/// with RNAfold output.
 pub fn fold_rna_mfe(raw_seq: &str) -> Result<RnaFoldReport, RnaError> {
     let full = sanitize_rna_sequence(raw_seq)?;
     let seq: String = full.chars().take(MAX_FOLD_RNA_LEN).collect();
@@ -555,7 +570,7 @@ pub fn render_rna_markdown(r: &NcRnaAnalysisReport) -> String {
     let _ = writeln!(md, "# ncRNA / mRNA Engineering Report: {}\n", r.name);
     let _ = writeln!(
         md,
-        "- **Class:** {} | **Length:** `{} nt` | **MFE (Zuker/Turner):** **`{:.2} kcal/mol`**",
+        "- **Class:** {} | **Length:** `{} nt` | **MFE (Zuker, in-house stacking model):** **`{:.2} kcal/mol`**",
         r.rna_class, r.fold.folded_len, r.fold.mfe_kcal_mol
     );
     let _ = writeln!(

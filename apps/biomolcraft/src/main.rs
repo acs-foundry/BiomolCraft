@@ -28,6 +28,32 @@ use craftbio_viewport::{
 };
 use eframe::egui;
 
+/// Path shown in the UI for the bundled pilot structures.
+///
+/// Rooted at the Craft data directory (`CRAFT_DATA_DIR`, else `$XDG_DATA_HOME/CraftBio`,
+/// else `$HOME/.local/share/CraftBio`) so it means something on any machine.
+fn example_structure_path(file_name: &str) -> String {
+    let non_blank = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let base = if let Some(dir) = non_blank("CRAFT_DATA_DIR") {
+        PathBuf::from(dir)
+    } else if let Some(xdg) = non_blank("XDG_DATA_HOME") {
+        PathBuf::from(xdg).join("CraftBio")
+    } else if let Some(home) = non_blank("HOME") {
+        PathBuf::from(home).join(".local/share/CraftBio")
+    } else {
+        PathBuf::from("CraftBio")
+    };
+    base.join("campaigns/biologics_pilot")
+        .join(file_name)
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickMode {
     Inspect,
@@ -180,8 +206,7 @@ impl BiomolCraftApp {
             viewport_scene: SharedViewportScene::default(),
             link_server,
             right_tab: RightModuleTab::Antibodies,
-            open_path_input: "/home/acs/Datos/CraftBio/campaigns/biologics_pilot/1N8Z.pdb"
-                .to_string(),
+            open_path_input: example_structure_path("1N8Z.pdb"),
             fetch_id_input: "1CRN".to_string(),
             console_input: String::new(),
             console_log: vec![
@@ -599,9 +624,7 @@ impl eframe::App for BiomolCraftApp {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Load Pilot: 1N8Z (Trastuzumab – HER2)").clicked() {
-                        self.open_path_input =
-                            "/home/acs/Datos/CraftBio/campaigns/biologics_pilot/1N8Z.pdb"
-                                .to_string();
+                        self.open_path_input = example_structure_path("1N8Z.pdb");
                         self.run_dsl(&format!("open {} replace", self.open_path_input));
                         ui.close_menu();
                     }
@@ -609,9 +632,7 @@ impl eframe::App for BiomolCraftApp {
                         .button("Load Pilot: 5JDS (Envafolimab VHH – PD-L1)")
                         .clicked()
                     {
-                        self.open_path_input =
-                            "/home/acs/Datos/CraftBio/campaigns/biologics_pilot/5JDS.pdb"
-                                .to_string();
+                        self.open_path_input = example_structure_path("5JDS.pdb");
                         self.run_dsl(&format!("open {} replace", self.open_path_input));
                         ui.close_menu();
                     }
@@ -619,9 +640,7 @@ impl eframe::App for BiomolCraftApp {
                         .button("Load Pilot: 1Y26 (Guanine Riboswitch ncRNA)")
                         .clicked()
                     {
-                        self.open_path_input =
-                            "/home/acs/Datos/CraftBio/campaigns/biologics_pilot/1Y26.pdb"
-                                .to_string();
+                        self.open_path_input = example_structure_path("1Y26.pdb");
                         self.run_dsl(&format!("open {} replace", self.open_path_input));
                         ui.close_menu();
                     }
