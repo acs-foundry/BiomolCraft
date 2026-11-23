@@ -252,7 +252,34 @@ impl BiomolCraftApp {
             }
         } else if let Some(open_p) = startup.open_file {
             app.open_path_input = open_p.display().to_string();
-            if let Ok(msg) = app.session.load_structure_file(&open_p) {
+            let low = open_p.to_string_lossy().to_ascii_lowercase();
+            if low.ends_with(".biomol.zip") {
+                if let Ok((restored, sum)) = biomol_script::load_session_zip(&open_p) {
+                    app.session = restored;
+                    app.session_zip_path = open_p.display().to_string();
+                    if sum.has_viewdock {
+                        app.right_tab = RightModuleTab::ViewDockX;
+                    }
+                    let msg = format!(
+                        "Loaded verified portable session '{}' ({} models, {} scenes, ViewDockX={}).",
+                        open_p.display(),
+                        sum.model_count,
+                        sum.scene_count,
+                        sum.has_viewdock
+                    );
+                    app.console_log.push(msg.clone());
+                    app.status_line = msg;
+                }
+            } else if low.ends_with(".dockbundle.json") {
+                if let Ok(raw) = std::fs::read_to_string(&open_p)
+                    && let Ok(bundle) = serde_json::from_str::<DockCraftSceneBundle>(&raw)
+                    && let Ok(msg) = app.session.load_dockcraft_bundle(bundle)
+                {
+                    app.right_tab = RightModuleTab::ViewDockX;
+                    app.console_log.push(msg.clone());
+                    app.status_line = msg;
+                }
+            } else if let Ok(msg) = app.session.load_structure_file(&open_p) {
                 app.console_log.push(msg.clone());
                 app.status_line = msg;
             }

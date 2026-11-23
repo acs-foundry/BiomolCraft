@@ -176,7 +176,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bio-adc"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "bio-core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "rayon",
  "serde",
@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "bio-develop"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "bio-core",
  "rayon",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "bio-engine"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "bio-adc",
  "bio-develop",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "bio-interface"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "bio-core",
  "serde",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "biomol-enzyme"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "craftbio-scene",
  "craftbio-struct",
@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "biomol-model"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "craftbio-scene",
  "craftbio-struct",
@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "biomol-modules"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "bio-adc",
  "bio-core",
@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "biomol-physics"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "craftbio-report",
  "craftbio-scene",
@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "biomol-rna"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "craftbio-report",
  "craftbio-struct",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "biomol-script"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "biomol-enzyme",
  "biomol-model",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "biomolcraft"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "biomol-enzyme",
  "biomol-model",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "biomolcraft-cli"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "biomol-enzyme",
  "biomol-model",
@@ -3710,7 +3710,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "1.0.1"
+version = "1.0.2"
 
 [[package]]
 name = "yoke"
