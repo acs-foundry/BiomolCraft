@@ -1583,7 +1583,7 @@ impl BiomolCraftApp {
         });
 
         ui.separator();
-        ui.strong("3D Binding Pocket Detector (fpocket / CASTp-style)");
+        ui.strong("3D Binding Pocket Detector (In-House 14-Ray Burial)");
         ui.horizontal(|ui| {
             if ui.button("Detect 3D Pockets").clicked() {
                 self.run_dsl("pockets 6");

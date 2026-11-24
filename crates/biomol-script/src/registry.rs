@@ -597,7 +597,7 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
         aliases: &["cavities"],
         category: "ViewDockX & Modules",
         syntax: "pockets [on|off|max_n]",
-        description: "Detect 3D druggable binding cavities (volume, enclosure, druggability) and display smooth pocket meshes.",
+        description: "Detect 3D recessed binding cavities (in-house 14-ray burial + heuristic druggability) and display cavity meshes.",
         subcommands: &["on", "off", "5", "8"],
     },
     CommandSpec {
@@ -621,7 +621,7 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
         aliases: &[],
         category: "ViewDockX & Modules",
         syntax: "rnafold <preset_id | RNA_SEQUENCE>",
-        description: "Fold an ncRNA/mRNA sequence via pure-Rust Zuker/Turner-2004 MFE.",
+        description: "Fold an ncRNA/mRNA sequence via pure-Rust Zuker-style MFE (in-house stacking model).",
         subcommands: &[
             "guanine_riboswitch",
             "crispr_sgrna",

@@ -619,7 +619,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Detect 3D druggable binding cavities (fpocket/CASTp-style), compute DockCraft GridBox & render cavity PNG.
+    /// Detect 3D recessed binding cavities (in-house 14-ray burial + heuristic druggability), compute DockCraft GridBox & render PNG.
     Pockets {
         #[arg(long)]
         pdb: PathBuf,

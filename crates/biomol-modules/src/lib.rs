@@ -351,7 +351,8 @@ pub fn run_ncrna_module(
         summary_markdown: md,
         provenance: vec![ProvenanceEntry {
             kind: ProvenanceKind::ComputationalPrediction,
-            source_app: "biomolcraft::mod-ncrna (Zuker MFE Turner-2004)".to_string(),
+            source_app: "biomolcraft::mod-ncrna (Zuker-style MFE in-house stacking model)"
+                .to_string(),
             summary: format!(
                 "Analyzed {} nucleic chain(s) and cross-checked {} 3D crystal base pairs.",
                 reports.len(),

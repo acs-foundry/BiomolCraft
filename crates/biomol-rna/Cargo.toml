@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "ncRNA, mRNA, siRNA, ASO & Riboswitch engineering module: exact Zuker/Turner-2004 MFE 2D folding, G-quadruplex & TLR/m1Psi audit, LNP calculator, and 2D/3D base-pair sync"
+description = "ncRNA, mRNA, siRNA, ASO & Riboswitch engineering module: deterministic Zuker-style MFE 2D folding (in-house stacking model), G-quadruplex & TLR/m1Psi audit, LNP calculator, and 2D/3D base-pair sync"
 
 [lints]
 workspace = true

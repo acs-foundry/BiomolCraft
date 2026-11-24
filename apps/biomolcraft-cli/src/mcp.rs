@@ -151,7 +151,7 @@ impl Tools for BiomolTools {
             tool(
                 "fold_ncrna_mrna",
                 "Fold & Audit ncRNA/mRNA",
-                "Run deterministic Zuker/Turner-2004 MFE 2D RNA folding, G-quadruplex & TLR7/8/m1Psi audit, and LNP formulation calculator.",
+                "Run deterministic Zuker-style MFE 2D RNA folding (in-house stacking model, not Turner-2004), G-quadruplex & TLR7/8/m1Psi audit, and LNP formulation calculator.",
                 object(
                     json!({
                         "name": string("Optional RNA construct name"),
@@ -433,7 +433,7 @@ impl Tools for BiomolTools {
             tool(
                 "detect_binding_pockets",
                 "3D Binding Pocket & Cavity Detector",
-                "Detect and rank 3D druggable binding cavities (volume, enclosure, hydrophobic/polar balance, druggability score, lining residues), render smooth cavity meshes, and sync the top pocket GridBox for DockCraft.",
+                "Detect and rank 3D recessed binding cavities using an in-house 14-ray burial and heuristic druggability model (not calibrated against fpocket), render cavity meshes, and sync the top pocket GridBox for DockCraft.",
                 object(
                     json!({
                         "max_pockets": { "type": "integer", "description": "Maximum pockets to return (default 6, max 16)" },
@@ -1323,6 +1323,27 @@ mod tests {
             &json!({ "command": "open\t/etc/hostname" }),
         );
         assert!(read_back.contains("\"isError\":true"), "{read_back}");
+
+        // Wave 8 regression: `load_xtc` is a filesystem verb and must be refused over `run_dsl`,
+        // while `load_xtc_trajectory` must reject paths outside the sandbox.
+        let xtc_dsl = call_tool(
+            &mut srv,
+            "run_dsl",
+            &json!({ "command": format!("load_xtc {}", outside.join("traj.xtc").display()) }),
+        );
+        assert!(xtc_dsl.contains("\"isError\":true"), "{xtc_dsl}");
+        let xtc_esc = call_tool(
+            &mut srv,
+            "load_xtc_trajectory",
+            &json!({ "path": "../outside/traj.xtc" }),
+        );
+        assert!(xtc_esc.contains("\"isError\":true"), "{xtc_esc}");
+        let pkt_ok = call_tool(
+            &mut srv,
+            "detect_binding_pockets",
+            &json!({ "max_pockets": 3 }),
+        );
+        assert!(!pkt_ok.contains("\"isError\":true"), "{pkt_ok}");
 
         // ...while compute-only verbs keep working: the guard is a whitelist, not a ban on
         // `run_dsl`. A command may still fail on its own scientific merits (no BIOMT records,
