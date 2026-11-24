@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use biomol_model::tug_atom_with_sculpting;
 use biomol_modules::{
     ModuleId, discover_installed_plugins, run_adc_module, run_antibody_module, run_enzyme_module,
     run_ncrna_module, run_pk_tmdd_module,
@@ -24,7 +25,7 @@ use craftbio_scene::{
 use craftbio_struct::{ResidueClass, write_pdb};
 use craftbio_viewport::{
     SharedViewportScene, pixels_per_angstrom_at_target, project_world_to_screen,
-    show_biomol_viewport,
+    show_biomol_viewport_ex,
 };
 use eframe::egui;
 
@@ -60,6 +61,7 @@ enum PickMode {
     Distance,
     Angle,
     Dihedral,
+    SculptDrag,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +184,11 @@ pub struct BiomolCraftApp {
     palette_open: bool,
     palette_query: String,
     session_zip_path: String,
+
+    // Wave 8 (v1.1.0): Live Mouse Drag-to-Sculpt & GROMACS .xtc loader state
+    sculpt_drag_atom: Option<usize>,
+    sculpt_last_feedback: String,
+    xtc_path_input: String,
 }
 
 impl Default for BiomolCraftApp {
@@ -210,7 +217,7 @@ impl BiomolCraftApp {
             fetch_id_input: "1CRN".to_string(),
             console_input: String::new(),
             console_log: vec![
-                "BiomolCraft v1.0.0 — Unified Command Palette (Ctrl+K) · [TAB] Autocomplete · .biomol.zip Sessions · ArtCraft Live Push · ViewDockX. Type 'help'.".to_string(),
+                "BiomolCraft v1.1.0 — PCF Soft Shadows · GROMACS .xtc · 3D Binding Pockets · Mouse Drag-to-Sculpt (Shift+Drag) · .biomol.zip · ViewDockX. Type 'help'.".to_string(),
                 link_status.to_string(),
             ],
             picked_atom_info: "Click any atom/residue in 3D or sequence strip to inspect".to_string(),
@@ -240,7 +247,7 @@ impl BiomolCraftApp {
             adc_dar: 8.0,
             pick_mode: PickMode::Inspect,
             pick_buffer: Vec::new(),
-            label2d_input: "BiomolCraft v1.0.0".to_string(),
+            label2d_input: "BiomolCraft v1.1.0".to_string(),
             scalebar_len_a: 20.0,
             pae_json_input: String::new(),
             morph_frames: 20,
@@ -264,6 +271,9 @@ impl BiomolCraftApp {
             palette_open: false,
             palette_query: String::new(),
             session_zip_path: "/tmp/biomolcraft_session.biomol.zip".to_string(),
+            sculpt_drag_atom: None,
+            sculpt_last_feedback: "Hold Shift + Left-Drag any atom (or select Sculpt Drag mode) to tug with live MM relaxation.".to_string(),
+            xtc_path_input: String::new(),
         };
 
         if let Some(bundle_path) = startup.dock_bundle {
@@ -782,7 +792,7 @@ impl eframe::App for BiomolCraftApp {
                     }
                     ui.label(
                         egui::RichText::new(
-                            "BiomolCraft v1.0.0 · SSAO · .biomol.zip · ArtCraft Push · ViewDockX",
+                            "BiomolCraft v1.1.0 · Soft Shadows · .xtc · 3D Pockets · Drag-to-Sculpt · ViewDockX",
                         )
                         .strong()
                         .color(egui::Color32::from_rgb(56, 189, 248)),
@@ -1262,6 +1272,15 @@ impl eframe::App for BiomolCraftApp {
                             changed |= ui
                                 .add(
                                     egui::Slider::new(
+                                        &mut self.session.render_opts.shadow_strength,
+                                        0.0..=1.0,
+                                    )
+                                    .text("Shadows"),
+                                )
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(
                                         &mut self.session.render_opts.surface_alpha,
                                         0.2..=1.0,
                                     )
@@ -1385,19 +1404,89 @@ impl eframe::App for BiomolCraftApp {
                 });
             });
 
-        // Center Primary 3D GPU Biomolecular Viewport (Offscreen Depth32Float + SSAO + 2D/3D HUD)
+        // Center Primary 3D GPU Biomolecular Viewport (PCF Soft Shadows + SSAO + Drag-to-Sculpt + HUD)
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
-                let resp = show_biomol_viewport(
+                let sculpt_drag_active = self.pick_mode == PickMode::SculptDrag
+                    || ctx.input(|i| i.modifiers.shift)
+                    || self.sculpt_drag_atom.is_some();
+                let resp = show_biomol_viewport_ex(
                     ui,
                     &mut self.session.camera,
                     &self.viewport_scene,
                     self.session.render_opts.show_silhouettes,
                     true,
+                    sculpt_drag_active,
                 );
                 // Paint live 3D/2D Labels, Color Key Legend & Calibrated Scale Bar directly over GPU viewport!
                 self.paint_viewport_hud(ui, resp.rect);
+
+                // Interactive Mouse 3D Drag-to-Sculpt (Shift + Left-Drag or SculptDrag mode)
+                if sculpt_drag_active
+                    && resp.drag_started_by(egui::PointerButton::Primary)
+                    && let Some(pos) = resp.interact_pointer_pos()
+                    && let Some(mol) = self.session.active_molecule()
+                {
+                    let rect = resp.rect;
+                    let nx = ((pos.x - rect.left()) / rect.width().max(1.0)) * 2.0 - 1.0;
+                    let ny = 1.0 - ((pos.y - rect.top()) / rect.height().max(1.0)) * 2.0;
+                    let aspect = rect.width() / rect.height().max(1.0);
+                    if let Some(ai) = self.session.camera.pick_atom(mol, nx, ny, aspect) {
+                        let a = &mol.atoms[ai];
+                        let lbl = format!("{}:{}{}.{}", a.chain, a.res_name, a.res_seq, a.name);
+                        self.session.push_undo_snapshot();
+                        self.sculpt_drag_atom = Some(ai);
+                        self.picked_atom_info = format!("Dragging {lbl} (live MM sculpting)...");
+                    }
+                }
+                if let Some(ai) = self.sculpt_drag_atom
+                    && resp.dragged_by(egui::PointerButton::Primary)
+                {
+                    let d = resp.drag_delta();
+                    if d.x * d.x + d.y * d.y > 0.25 {
+                        let cam = self.session.camera.clone();
+                        let h_px = resp.rect.height().max(1.0);
+                        if let Some(mol) = self.session.active_molecule_mut()
+                            && let Some(atom) = mol.atoms.get(ai)
+                        {
+                            let raw_disp =
+                                cam.unproject_screen_delta_at_point(atom.coords, d.x, d.y, h_px);
+                            let len = (raw_disp[0].powi(2)
+                                + raw_disp[1].powi(2)
+                                + raw_disp[2].powi(2))
+                            .sqrt();
+                            let disp = if len > 1.1 {
+                                let k = 1.1 / len;
+                                [raw_disp[0] * k, raw_disp[1] * k, raw_disp[2] * k]
+                            } else {
+                                raw_disp
+                            };
+                            if let Ok(rep) = tug_atom_with_sculpting(mol, ai, disp, 5.5, 22) {
+                                let fb = format!(
+                                    "Sculpt {} | {} atoms | MM E: {:.1}->{:.1} kcal/mol | ΔΔG_local: {:+.2}",
+                                    rep.atom_label,
+                                    rep.atoms_sculpted,
+                                    rep.energy_before_kcal,
+                                    rep.energy_after_kcal,
+                                    rep.local_ddg_kcal
+                                );
+                                self.picked_atom_info = fb.clone();
+                                self.sculpt_last_feedback = fb.clone();
+                                self.status_line = fb;
+                                self.session.dirty_geometry = true;
+                                self.sync_viewport_scene();
+                            }
+                        }
+                    }
+                }
+                if self.sculpt_drag_atom.is_some()
+                    && (resp.drag_stopped_by(egui::PointerButton::Primary)
+                        || !ctx.input(|i| i.pointer.primary_down()))
+                {
+                    self.sculpt_drag_atom = None;
+                    self.console_log.push(self.sculpt_last_feedback.clone());
+                }
 
                 if resp.clicked()
                     && let Some(pos) = resp.interact_pointer_pos()
@@ -1411,12 +1500,13 @@ impl eframe::App for BiomolCraftApp {
                         let a = &mol.atoms[ai];
                         self.mut_chain = a.chain.to_string();
                         self.mut_res_seq = a.res_seq;
+                        self.tug_atom_spec = format!("{}:{}:{}", a.chain, a.res_seq, a.name);
                         self.picked_atom_info = format!(
                             "Picked {}:{}{}.{} ({}, B={:.1})",
                             a.chain, a.res_name, a.res_seq, a.name, a.element, a.b_factor
                         );
                         match self.pick_mode {
-                            PickMode::Inspect => {}
+                            PickMode::Inspect | PickMode::SculptDrag => {}
                             PickMode::Distance => {
                                 self.pick_buffer.push(ai);
                                 if self.pick_buffer.len() >= 2 {
@@ -1491,6 +1581,51 @@ impl BiomolCraftApp {
                     .hint_text("optional path (empty = open DockCraft GUI)"),
             );
         });
+
+        ui.separator();
+        ui.strong("3D Binding Pocket Detector (fpocket / CASTp-style)");
+        ui.horizontal(|ui| {
+            if ui.button("Detect 3D Pockets").clicked() {
+                self.run_dsl("pockets 6");
+            }
+            if !self.session.binding_pockets.is_empty() && ui.small_button("Hide Pockets").clicked()
+            {
+                self.run_dsl("pockets off");
+            }
+        });
+        if !self.session.binding_pockets.is_empty() {
+            let mut pick_pocket: Option<usize> = None;
+            let mut send_pocket_to_dock: Option<usize> = None;
+            for p in &self.session.binding_pockets {
+                let is_sel = self.session.selected_pocket_id == Some(p.pocket_id);
+                ui.horizontal(|ui| {
+                    let lbl = format!(
+                        "#{}: Drug {:.2} · {:.0} Å³ · Enc {:.0}%",
+                        p.pocket_id,
+                        p.druggability_score,
+                        p.volume_a3,
+                        p.enclosure * 100.0
+                    );
+                    if ui.selectable_label(is_sel, lbl).clicked() {
+                        pick_pocket = Some(p.pocket_id);
+                    }
+                    if ui
+                        .small_button("→ DockCraft")
+                        .on_hover_text("Snap GridBox to this pocket and launch/sync DockCraft")
+                        .clicked()
+                    {
+                        send_pocket_to_dock = Some(p.pocket_id);
+                    }
+                });
+            }
+            if let Some(pid) = pick_pocket {
+                self.run_dsl(&format!("pocket_box {pid}"));
+            }
+            if let Some(pid) = send_pocket_to_dock {
+                self.run_dsl(&format!("pocket_box {pid}"));
+                self.dock_here_in_dockcraft();
+            }
+        }
 
         let mut dirty = false;
         let mut select_pose: Option<usize> = None;
@@ -1770,6 +1905,20 @@ impl BiomolCraftApp {
                 self.run_dsl(&cmd);
             }
         });
+        ui.horizontal(|ui| {
+            let is_sculpt = self.pick_mode == PickMode::SculptDrag;
+            if ui
+                .selectable_label(is_sculpt, "Mouse Drag-to-Sculpt (or hold Shift+Drag)")
+                .clicked()
+            {
+                self.pick_mode = if is_sculpt {
+                    PickMode::Inspect
+                } else {
+                    PickMode::SculptDrag
+                };
+            }
+        });
+        ui.small(&self.sculpt_last_feedback);
 
         ui.separator();
         ui.strong("3D Structure Builder (Peptide Helix/Sheet · A-RNA Duplex)");
@@ -1828,6 +1977,27 @@ impl BiomolCraftApp {
             if ui.button("Run Pure-Rust Langevin MD (120 steps)").clicked() {
                 self.run_dsl("md 120");
                 self.playing_trajectory = true;
+            }
+        });
+        ui.separator();
+        ui.strong("GROMACS `.xtc` & CHARMM/OpenMM `.dcd` Trajectory Loader");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.xtc_path_input)
+                    .desired_width(205.0)
+                    .hint_text("/path/to/traj.xtc or traj.dcd"),
+            );
+            if ui.small_button("Load Traj").clicked() {
+                let p = self.xtc_path_input.trim().to_string();
+                if !p.is_empty() {
+                    let verb = if p.to_ascii_lowercase().ends_with(".xtc") {
+                        "load_xtc"
+                    } else {
+                        "load_dcd"
+                    };
+                    self.run_dsl(&format!("{verb} {p}"));
+                    self.playing_trajectory = true;
+                }
             }
         });
         ui.separator();
@@ -2358,6 +2528,7 @@ impl BiomolCraftApp {
                 (PickMode::Distance, "Distance (2)"),
                 (PickMode::Angle, "Angle (3)"),
                 (PickMode::Dihedral, "Dihedral (4)"),
+                (PickMode::SculptDrag, "Sculpt Drag (Shift)"),
             ] {
                 if ui.selectable_value(&mut self.pick_mode, m, lbl).clicked() {
                     self.pick_buffer.clear();

@@ -37,12 +37,15 @@ use craftbio_scene::{
     send_trajectory_via_craft_link,
 };
 use craftbio_struct::{
-    cealign_superpose, detect_clashes, detect_contacts, detect_hbonds, detect_snfg_glycans,
-    estimate_pae_proxy_from_structure, generate_biological_assembly, generate_crystal_mates,
-    load_dcd_frames, matchmaker_align, morph_biomolecules, parse_dx_map, parse_mrc_map,
-    parse_pae_json, parse_structure_auto, write_mrc_map, write_multi_model_pdb, write_pdb,
+    cealign_superpose, detect_binding_pockets, detect_clashes, detect_contacts, detect_hbonds,
+    detect_snfg_glycans, estimate_pae_proxy_from_structure, generate_biological_assembly,
+    generate_crystal_mates, load_dcd_frames, matchmaker_align, morph_biomolecules, parse_dx_map,
+    parse_mrc_map, parse_pae_json, parse_structure_auto, write_mrc_map, write_multi_model_pdb,
+    write_pdb, write_xtc_frames,
 };
-use craftbio_viewport::{render_scene_png_bytes, write_scene_png};
+use craftbio_viewport::{
+    render_scene_png_bytes, render_scene_rgba, write_movie_file, write_scene_png,
+};
 
 #[derive(Parser)]
 #[command(
@@ -108,6 +111,12 @@ enum Commands {
         wireframe: bool,
         #[arg(long, default_value_t = 0.60)]
         ssao: f32,
+        #[arg(
+            long,
+            default_value_t = 0.55,
+            help = "Directional PCF 3x3 soft shadow map strength (0.0 = off, 0.55 = default, 1.0 = deep)"
+        )]
+        shadows: f32,
         #[arg(long)]
         clip_near: Option<f32>,
         #[arg(long)]
@@ -610,6 +619,43 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Detect 3D druggable binding cavities (fpocket/CASTp-style), compute DockCraft GridBox & render cavity PNG.
+    Pockets {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long, default_value_t = 6)]
+        max_pockets: usize,
+        #[arg(long)]
+        out_json: Option<PathBuf>,
+        #[arg(long)]
+        out_md: Option<PathBuf>,
+        #[arg(long)]
+        out_png: Option<PathBuf>,
+        #[arg(long, default_value_t = 1600)]
+        width: u32,
+        #[arg(long, default_value_t = 1200)]
+        height: u32,
+    },
+    /// Load, validate, or generate a pure-Rust GROMACS `.xtc` compressed trajectory (`3dfcoord`) and render frames/GIF.
+    Xtc {
+        #[arg(long)]
+        pdb: PathBuf,
+        #[arg(long, help = "Existing GROMACS .xtc trajectory to load")]
+        xtc: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Generate an ANM collective-mode .xtc trajectory, save to this path, and verify reload roundtrip"
+        )]
+        write_demo_xtc: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        frame: usize,
+        #[arg(long)]
+        out_png: Option<PathBuf>,
+        #[arg(long)]
+        out_gif: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn write_text(path: &Path, text: &str) -> Result<(), String> {
@@ -668,6 +714,7 @@ fn run() -> Result<(), String> {
             surface,
             wireframe,
             ssao,
+            shadows,
             clip_near,
             clip_far,
             width,
@@ -680,7 +727,9 @@ fn run() -> Result<(), String> {
             let mut sess = BiomolSession::default();
             sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
             let _ = sess
-                .execute_dsl(&format!("style {style}; color {color}; ssao {ssao:.2}"))
+                .execute_dsl(&format!(
+                    "style {style}; color {color}; ssao {ssao:.2}; shadows {shadows:.2}"
+                ))
                 .map_err(|e| e.to_string())?;
             if let Some(p) = preset {
                 let _ = sess
@@ -2128,6 +2177,172 @@ fn run() -> Result<(), String> {
                 );
             } else {
                 print!("{}", render_registry_help(q));
+            }
+        }
+        Commands::Pockets {
+            pdb,
+            max_pockets,
+            out_json,
+            out_md,
+            out_png,
+            width,
+            height,
+        } => {
+            let mut sess = BiomolSession::default();
+            sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+            let msg = sess
+                .detect_pockets(max_pockets)
+                .map_err(|e| e.to_string())?;
+            println!("{msg}");
+            if let Some(jp) = out_json {
+                let json_str = serde_json::to_string_pretty(&sess.binding_pockets)
+                    .map_err(|e| e.to_string())?;
+                write_text(&jp, &json_str)?;
+                println!(
+                    "Wrote {} binding pocket(s) JSON -> {}",
+                    sess.binding_pockets.len(),
+                    jp.display()
+                );
+            }
+            if let Some(mp) = out_md {
+                write_text(&mp, &sess.last_module_markdown)?;
+                println!("Wrote binding pockets Markdown -> {}", mp.display());
+            }
+            if let Some(pp) = out_png {
+                let _ = sess.execute_dsl("preset pub_dark; shadows 0.75; scalebar 15");
+                if !sess.binding_pockets.is_empty() {
+                    let _ = sess.select_pocket_gridbox(1);
+                    // Pull camera gently back so both the receptor cartoon and full golden GridBox fit cleanly
+                    sess.camera.distance = (sess.camera.distance * 1.45).max(46.0);
+                    let top = &sess.binding_pockets[0];
+                    let _ = sess.execute_dsl(&format!(
+                        "2dlabel 0.03 0.03 Pocket #1: Drug={:.2} | Vol={:.0} A3 | Enc={:.0}%",
+                        top.druggability_score,
+                        top.volume_a3,
+                        top.enclosure * 100.0
+                    ));
+                }
+                let sc = sess.build_viewport_scene();
+                let bytes = write_scene_png(&sc, &sess.camera, width, height, false, &pp)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "Rendered 3D Binding Pockets + GridBox {}x{} PNG -> {} ({bytes} bytes).",
+                    width,
+                    height,
+                    pp.display()
+                );
+            } else {
+                let _ = detect_binding_pockets; // keep explicit import used
+            }
+        }
+        Commands::Xtc {
+            pdb,
+            xtc,
+            write_demo_xtc,
+            frame,
+            out_png,
+            out_gif,
+            json,
+        } => {
+            let mut sess = BiomolSession::default();
+            sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+            let xtc_path_loaded = if let Some(demo_out) = write_demo_xtc {
+                let _ = sess.execute_dsl("anm 1 2.4").map_err(|e| e.to_string())?;
+                let mol = sess.active_molecule().ok_or("no active molecule")?;
+                let xtc_bytes = write_xtc_frames(mol, 1000.0).map_err(|e| e.to_string())?;
+                if let Some(parent) = demo_out.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&demo_out, &xtc_bytes).map_err(|e| e.to_string())?;
+                // Reload freshly encoded XTC onto clean structure to verify lossless roundtrip
+                sess.load_structure_file(&pdb).map_err(|e| e.to_string())?;
+                let raw_rt = std::fs::read(&demo_out).map_err(|e| e.to_string())?;
+                let msg = sess
+                    .load_xtc_bytes(&raw_rt, &demo_out.display().to_string())
+                    .map_err(|e| e.to_string())?;
+                if !json {
+                    println!(
+                        "Wrote pure-Rust GROMACS .xtc ({} bytes) -> {}\n{msg}",
+                        xtc_bytes.len(),
+                        demo_out.display()
+                    );
+                }
+                demo_out
+            } else if let Some(xtc_p) = xtc {
+                let raw = std::fs::read(&xtc_p).map_err(|e| e.to_string())?;
+                let msg = sess
+                    .load_xtc_bytes(&raw, &xtc_p.display().to_string())
+                    .map_err(|e| e.to_string())?;
+                if !json {
+                    println!("{msg}");
+                }
+                xtc_p
+            } else {
+                return Err(
+                    "provide either --xtc <in.xtc> or --write-demo-xtc <out.xtc>".to_string(),
+                );
+            };
+
+            let n_frames = sess.active_molecule().map_or(0, |m| m.frames.len());
+            let natoms = sess.active_molecule().map_or(0, |m| m.atoms.len());
+            let t_end = sess
+                .active_molecule()
+                .and_then(|m| m.frames.last())
+                .map_or(0.0, |f| f.time_ps);
+            if frame < n_frames
+                && let Some(mol) = sess.active_molecule_mut()
+            {
+                mol.set_active_frame(frame);
+            }
+            if let Some(pp) = out_png {
+                let _ = sess.execute_dsl("preset pub_dark; shadows 0.65; scalebar 15");
+                let sc = sess.build_viewport_scene();
+                let bytes = write_scene_png(&sc, &sess.camera, 1280, 960, false, &pp)
+                    .map_err(|e| e.to_string())?;
+                if !json {
+                    println!(
+                        "Rendered XTC frame {}/{} -> {} ({bytes} bytes).",
+                        frame + 1,
+                        n_frames,
+                        pp.display()
+                    );
+                }
+            }
+            if let Some(gp) = out_gif {
+                let _ = sess.execute_dsl("preset pub_dark; shadows 0.60");
+                let mut frames_rgba = Vec::with_capacity(n_frames);
+                for fi in 0..n_frames {
+                    if let Some(mol) = sess.active_molecule_mut() {
+                        mol.set_active_frame(fi);
+                    }
+                    let sc = sess.build_viewport_scene();
+                    frames_rgba.push(
+                        render_scene_rgba(&sc, &sess.camera, 480, 360, false)
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+                let bytes =
+                    write_movie_file(&gp, 480, 360, 12, &frames_rgba).map_err(|e| e.to_string())?;
+                if !json {
+                    println!(
+                        "Rendered XTC animated GIF ({n_frames} frames) -> {} ({bytes} bytes).",
+                        gp.display()
+                    );
+                }
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "xtc_path": xtc_path_loaded.display().to_string(),
+                        "atoms": natoms,
+                        "frames": n_frames,
+                        "duration_ps": t_end,
+                    }))
+                    .map_err(|e| e.to_string())?
+                );
             }
         }
     }

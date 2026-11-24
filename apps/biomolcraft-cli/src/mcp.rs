@@ -430,6 +430,29 @@ impl Tools for BiomolTools {
                 ),
                 Effect::Files,
             ),
+            tool(
+                "detect_binding_pockets",
+                "3D Binding Pocket & Cavity Detector",
+                "Detect and rank 3D druggable binding cavities (volume, enclosure, hydrophobic/polar balance, druggability score, lining residues), render smooth cavity meshes, and sync the top pocket GridBox for DockCraft.",
+                object(
+                    json!({
+                        "max_pockets": { "type": "integer", "description": "Maximum pockets to return (default 6, max 16)" },
+                        "select_rank": { "type": "integer", "description": "Optional 1-based pocket rank to focus and sync GridBox onto" }
+                    }),
+                    &[],
+                ),
+                Effect::Edits,
+            ),
+            tool(
+                "load_xtc_trajectory",
+                "Load GROMACS .xtc Trajectory",
+                "Decode a compressed binary GROMACS .xtc MD trajectory (pure-Rust 3dfcoord codec) from inside the sandbox read root and attach frames to the active biomolecule.",
+                object(
+                    json!({ "path": string("Relative or sandbox-confined path to .xtc file") }),
+                    &["path"],
+                ),
+                Effect::Edits,
+            ),
         ]
     }
 
@@ -1052,6 +1075,35 @@ impl Tools for BiomolTools {
                     Err(e) => text_result(format!("sandbox write rejected: {e}"), true),
                 }
             }
+            "detect_binding_pockets" => {
+                let max_p = args
+                    .get("max_pockets")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(6)
+                    .clamp(1, 16) as usize;
+                match self.session.detect_pockets(max_p) {
+                    Ok(msg) => {
+                        if let Some(rank) = args.get("select_rank").and_then(Value::as_u64) {
+                            let _ = self.session.select_pocket_gridbox(rank as usize);
+                        }
+                        text_result(
+                            format!("{msg}\n\n{}", self.session.last_module_markdown),
+                            false,
+                        )
+                    }
+                    Err(e) => text_result(e.to_string(), true),
+                }
+            }
+            "load_xtc_trajectory" => {
+                let p = args.get("path").and_then(Value::as_str).unwrap_or("");
+                match self.sandbox.read_bytes(Path::new(p)) {
+                    Ok(raw) => match self.session.load_xtc_bytes(&raw, p) {
+                        Ok(msg) => text_result(msg, false),
+                        Err(e) => text_result(e.to_string(), true),
+                    },
+                    Err(e) => text_result(format!("sandbox read rejected: {e}"), true),
+                }
+            }
             other => text_result(format!("unknown tool '{other}'"), true),
         }
     }
@@ -1117,7 +1169,7 @@ mod tests {
             .pointer("/result/tools")
             .and_then(Value::as_array)
             .ok_or("no tools")?;
-        assert_eq!(tools.len(), 28);
+        assert_eq!(tools.len(), 30);
 
         let rna = srv
             .handle_line(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fold_ncrna_mrna","arguments":{"preset":"guanine_riboswitch"}}}"#)

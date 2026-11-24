@@ -172,6 +172,14 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
         subcommands: &["0.0", "0.55", "0.75"],
     },
     CommandSpec {
+        name: "shadows",
+        aliases: &["shadow"],
+        category: "Visual & Rendering",
+        syntax: "shadows <on|off|0.0..1.0>",
+        description: "Toggle or tune directional PCF 3x3 soft shadow maps (GPU + headless 4K PNG).",
+        subcommands: &["on", "off", "0.55", "0.80"],
+    },
+    CommandSpec {
         name: "bg",
         aliases: &["background"],
         category: "Visual & Rendering",
@@ -585,6 +593,22 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
         subcommands: &["from_selection", "off"],
     },
     CommandSpec {
+        name: "pockets",
+        aliases: &["cavities"],
+        category: "ViewDockX & Modules",
+        syntax: "pockets [on|off|max_n]",
+        description: "Detect 3D druggable binding cavities (volume, enclosure, druggability) and display smooth pocket meshes.",
+        subcommands: &["on", "off", "5", "8"],
+    },
+    CommandSpec {
+        name: "pocket_box",
+        aliases: &[],
+        category: "ViewDockX & Modules",
+        syntax: "pocket_box <rank_1..N>",
+        description: "Highlight detected pocket #rank and snap active DockCraft GridBox3D onto that binding pocket.",
+        subcommands: &["1", "2", "3"],
+    },
+    CommandSpec {
         name: "module",
         aliases: &[],
         category: "ViewDockX & Modules",
@@ -643,6 +667,14 @@ pub const COMMAND_REGISTRY: &[CommandSpec] = &[
         category: "ViewDockX & Modules",
         syntax: "load_dcd <trajectory.dcd>",
         description: "Attach a binary CHARMM/OpenMM .dcd trajectory to the active model.",
+        subcommands: &[],
+    },
+    CommandSpec {
+        name: "load_xtc",
+        aliases: &[],
+        category: "ViewDockX & Modules",
+        syntax: "load_xtc <trajectory.xtc>",
+        description: "Attach a compressed GROMACS .xtc trajectory to the active model (pure-Rust 3dfcoord codec).",
         subcommands: &[],
     },
     CommandSpec {
@@ -801,7 +833,7 @@ pub fn render_registry_help(filter: &str) -> String {
         return format!("No commands match '{filter}'. Type `help` to list all commands.");
     }
     let mut out = format!(
-        "BiomolCraft v1.0.0 Unified Command Registry ({} commands; press [TAB] to autocomplete or Ctrl+K for Command Palette):\n",
+        "BiomolCraft v1.1.0 Unified Command Registry ({} commands; press [TAB] to autocomplete or Ctrl+K for Command Palette):\n",
         specs.len()
     );
     let mut last_cat = "";
@@ -842,6 +874,7 @@ pub const FILESYSTEM_VERBS: &[&str] = &[
     "open_session",
     "load_dock",
     "load_dcd",
+    "load_xtc",
     "open_map",
     "pae",
     "export_mesh",
@@ -866,6 +899,8 @@ pub const COMPUTE_VERBS: &[&str] = &[
     "clip",
     "lighting",
     "ssao",
+    "shadows",
+    "shadow",
     "bg",
     "background",
     "preset",
@@ -877,6 +912,9 @@ pub const COMPUTE_VERBS: &[&str] = &[
     "waters",
     "pose",
     "gridbox",
+    "pockets",
+    "cavities",
+    "pocket_box",
     "select",
     "sele",
     "mutate",

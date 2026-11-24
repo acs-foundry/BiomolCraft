@@ -16,8 +16,8 @@ use craftbio_scene::{
     read_verified_zip, read_verified_zip_bytes, write_verified_zip_bytes,
 };
 use craftbio_struct::{
-    GeometryAxis, GeometryPlane, MsaAlignment, PaeMatrix, parse_mrc_map, parse_pdb,
-    parse_sdf_poses, write_mrc_map, write_multi_model_pdb, write_pdb,
+    BindingPocket3D, GeometryAxis, GeometryPlane, MsaAlignment, PaeMatrix, parse_mrc_map,
+    parse_pdb, parse_sdf_poses, write_mrc_map, write_multi_model_pdb, write_pdb,
 };
 use craftbio_viewport::{Camera3D, RenderOptions};
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,10 @@ pub struct SessionZipSummary {
     pub model_names: Vec<String>,
 }
 
+fn default_shadow_strength() -> f32 {
+    0.55
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ArchivedRenderOpts {
     representation: RepresentationKind,
@@ -57,6 +61,8 @@ struct ArchivedRenderOpts {
     show_silhouettes: bool,
     lighting: LightingPreset,
     ssao_strength: f32,
+    #[serde(default = "default_shadow_strength")]
+    shadow_strength: f32,
     background: [f32; 4],
     #[serde(default)]
     residue_highlights: Vec<(char, i32, [f32; 3])>,
@@ -91,6 +97,7 @@ impl From<&RenderOptions> for ArchivedRenderOpts {
             show_silhouettes: o.show_silhouettes,
             lighting: o.lighting,
             ssao_strength: o.ssao_strength,
+            shadow_strength: o.shadow_strength,
             background: o.background,
             residue_highlights: rh,
             sphere_overlays: o.sphere_overlays.clone(),
@@ -120,6 +127,7 @@ impl ArchivedRenderOpts {
             show_silhouettes: self.show_silhouettes,
             lighting: self.lighting,
             ssao_strength: self.ssao_strength,
+            shadow_strength: self.shadow_strength,
             background: self.background,
             residue_highlights,
             sphere_overlays: self.sphere_overlays,
@@ -190,6 +198,10 @@ struct SessionArchiveManifest {
     viewdock_poses: usize,
     provenance: Vec<ProvenanceEntry>,
     command_history: Vec<String>,
+    #[serde(default)]
+    binding_pockets: Vec<BindingPocket3D>,
+    #[serde(default)]
+    selected_pocket_id: Option<usize>,
 }
 
 /// Encode the entire multi-model `BiomolSession` into verified `.biomol.zip` bytes.
@@ -284,6 +296,8 @@ pub fn encode_session_zip_bytes(
         viewdock_poses,
         provenance: session.provenance.clone(),
         command_history: session.command_history.clone(),
+        binding_pockets: session.binding_pockets.clone(),
+        selected_pocket_id: session.selected_pocket_id,
     };
 
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
@@ -492,6 +506,8 @@ pub fn decode_session_zip_bytes(
         labels_2d: manifest.labels_2d,
         color_key: manifest.color_key,
         scale_bar: manifest.scale_bar,
+        binding_pockets: manifest.binding_pockets,
+        selected_pocket_id: manifest.selected_pocket_id,
         dirty_geometry: true,
     };
 

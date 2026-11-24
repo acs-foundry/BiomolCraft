@@ -32,20 +32,20 @@ use craftbio_scene::{
     SelectionBoxSnapshot, SphereOverlay, push_to_artcraft_via_craft_link,
 };
 use craftbio_struct::{
-    Biomolecule, GeometryAxis, GeometryPlane, MsaAlignment, PaeMatrix, ResidueClass, VolumeGrid3D,
-    axis_angle_deg, build_synchronized_msa, cealign_superpose, compute_best_fit_plane,
-    compute_geometry_axis, detect_clashes, detect_contacts, detect_hbonds, detect_snfg_glycans,
-    estimate_pae_proxy_from_structure, evaluate_selection, generate_biological_assembly,
-    generate_crystal_mates, load_dcd_frames, matchmaker_align, measure_angle_deg,
-    measure_dihedral_deg, measure_distance, morph_biomolecules, parse_dx_map, parse_mrc_map,
-    parse_pae_json, parse_sdf_poses, parse_structure_auto, write_mmcif, write_multi_model_pdb,
-    write_pdb,
+    BindingPocket3D, Biomolecule, GeometryAxis, GeometryPlane, MsaAlignment, PaeMatrix,
+    ResidueClass, VolumeGrid3D, axis_angle_deg, build_synchronized_msa, cealign_superpose,
+    compute_best_fit_plane, compute_geometry_axis, detect_binding_pockets, detect_clashes,
+    detect_contacts, detect_hbonds, detect_snfg_glycans, estimate_pae_proxy_from_structure,
+    evaluate_selection, generate_biological_assembly, generate_crystal_mates, load_dcd_frames,
+    load_xtc_frames, matchmaker_align, measure_angle_deg, measure_dihedral_deg, measure_distance,
+    morph_biomolecules, parse_dx_map, parse_mrc_map, parse_pae_json, parse_sdf_poses,
+    parse_structure_auto, write_mmcif, write_multi_model_pdb, write_pdb,
 };
 use craftbio_viewport::{
     Camera3D, CapsuleInstance, RenderOptions, RenderSceneData, SphereInstance,
-    build_orthoplanes_mesh, build_render_scene, extract_isosurface_mesh, push_grid_box_wireframe,
-    render_fly_frames, render_rock_frames, render_scene_png_bytes, render_scene_rgba,
-    render_turntable_frames, write_movie_file, write_scene_png,
+    build_orthoplanes_mesh, build_pockets_mesh, build_render_scene, extract_isosurface_mesh,
+    push_grid_box_wireframe, render_fly_frames, render_rock_frames, render_scene_png_bytes,
+    render_scene_rgba, render_turntable_frames, write_movie_file, write_scene_png,
 };
 pub use fetch::{FetchedAsset, fetch_structure_spec};
 pub use registry::{
@@ -207,6 +207,10 @@ pub struct SceneModel {
     pub redo_stack: Vec<Biomolecule>,
 }
 
+fn default_scene_shadow() -> f32 {
+    0.55
+}
+
 /// Restorable ChimeraX / PyMOL Scene snapshot (`F1–F12` or named scene).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedScene {
@@ -215,6 +219,8 @@ pub struct SavedScene {
     pub lighting: LightingPreset,
     pub background: [f32; 4],
     pub ssao_strength: f32,
+    #[serde(default = "default_scene_shadow")]
+    pub shadow_strength: f32,
     pub show_silhouettes: bool,
     pub model_states: Vec<(u32, bool, RepresentationKind, ColorScheme, bool)>,
     pub active_dock_pose: Option<usize>,
@@ -297,6 +303,8 @@ pub struct BiomolSession {
     pub labels_2d: Vec<Label2D>,
     pub color_key: Option<ColorKeyLegend>,
     pub scale_bar: Option<ScaleBarSpec>,
+    pub binding_pockets: Vec<BindingPocket3D>,
+    pub selected_pocket_id: Option<usize>,
     pub dirty_geometry: bool,
 }
 
@@ -328,6 +336,8 @@ impl Default for BiomolSession {
             labels_2d: Vec::new(),
             color_key: None,
             scale_bar: None,
+            binding_pockets: Vec::new(),
+            selected_pocket_id: None,
             dirty_geometry: true,
         }
     }
@@ -435,6 +445,7 @@ impl BiomolSession {
             m.render_opts.show_silhouettes = g.show_silhouettes;
             m.render_opts.lighting = g.lighting;
             m.render_opts.ssao_strength = g.ssao_strength;
+            m.render_opts.shadow_strength = g.shadow_strength;
             m.render_opts.background = g.background;
             m.render_opts.residue_highlights = g.residue_highlights;
             m.render_opts.sphere_overlays = g.sphere_overlays;
@@ -451,11 +462,13 @@ impl BiomolSession {
             let bg = self.render_opts.background;
             let light = self.render_opts.lighting;
             let ssao = self.render_opts.ssao_strength;
+            let shadow = self.render_opts.shadow_strength;
             let sil = self.render_opts.show_silhouettes;
             self.render_opts = m.render_opts.clone();
             self.render_opts.background = bg;
             self.render_opts.lighting = light;
             self.render_opts.ssao_strength = ssao;
+            self.render_opts.shadow_strength = shadow;
             self.render_opts.show_silhouettes = sil;
         }
     }
@@ -472,6 +485,7 @@ impl BiomolSession {
             background: self.render_opts.background,
             lighting: self.render_opts.lighting,
             ssao_strength: self.render_opts.ssao_strength,
+            shadow_strength: self.render_opts.shadow_strength,
             show_silhouettes: self.render_opts.show_silhouettes,
             ..RenderOptions::default()
         };
@@ -491,6 +505,8 @@ impl BiomolSession {
             self.next_model_id = 1;
             self.named_selections.clear();
             self.viewdock = None;
+            self.binding_pockets.clear();
+            self.selected_pocket_id = None;
         }
         let id_num = self.next_model_id;
         self.next_model_id += 1;
@@ -859,6 +875,7 @@ impl BiomolSession {
             background: self.render_opts.background,
             lighting: self.render_opts.lighting,
             ssao_strength: self.render_opts.ssao_strength,
+            shadow_strength: self.render_opts.shadow_strength,
             show_silhouettes: self.render_opts.show_silhouettes,
             ..Default::default()
         };
@@ -871,8 +888,17 @@ impl BiomolSession {
             opts.background = self.render_opts.background;
             opts.lighting = self.render_opts.lighting;
             opts.ssao_strength = self.render_opts.ssao_strength;
+            opts.shadow_strength = self.render_opts.shadow_strength;
             opts.show_silhouettes = self.render_opts.show_silhouettes;
             scene.merge_from(build_render_scene(&m.molecule, &opts));
+        }
+
+        // Detected 3D Druggable Binding Pocket cavity meshes (Marching Tetrahedra)
+        if !self.binding_pockets.is_empty() {
+            let pocket_mesh = build_pockets_mesh(&self.binding_pockets, self.selected_pocket_id);
+            if !pocket_mesh.indices.is_empty() {
+                scene.transparent_meshes.push(pocket_mesh);
+            }
         }
 
         // Volumetric Cryo-EM / APBS Marching-Tetrahedra isosurface mesh + optional Orthoplanes
@@ -1397,6 +1423,7 @@ impl BiomolSession {
             lighting: self.render_opts.lighting,
             background: self.render_opts.background,
             ssao_strength: self.render_opts.ssao_strength,
+            shadow_strength: self.render_opts.shadow_strength,
             show_silhouettes: self.render_opts.show_silhouettes,
             model_states: self
                 .models
@@ -1430,6 +1457,7 @@ impl BiomolSession {
         self.render_opts.lighting = snap.lighting;
         self.render_opts.background = snap.background;
         self.render_opts.ssao_strength = snap.ssao_strength;
+        self.render_opts.shadow_strength = snap.shadow_strength;
         self.render_opts.show_silhouettes = snap.show_silhouettes;
         for (mid, vis, repr, col, surf) in snap.model_states {
             if let Some(m) = self.models.iter_mut().find(|m| m.model_id == mid) {
@@ -1484,7 +1512,8 @@ impl BiomolSession {
         }
     }
 
-    fn push_undo_snapshot(&mut self) {
+    /// Push a transactional Undo snapshot of the active biomolecule before a 3D edit or drag stroke.
+    pub fn push_undo_snapshot(&mut self) {
         if let Some(m) = self.active_model_mut() {
             m.undo_stack.push(m.molecule.clone());
             if m.undo_stack.len() > 25 {
@@ -1492,6 +1521,146 @@ impl BiomolSession {
             }
             m.redo_stack.clear();
         }
+    }
+
+    /// Decode a binary GROMACS `.xtc` trajectory buffer into the active biomolecule.
+    pub fn load_xtc_bytes(
+        &mut self,
+        bytes: &[u8],
+        source_label: &str,
+    ) -> Result<String, ScriptError> {
+        let mol = self
+            .active_molecule_mut()
+            .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+        let loaded =
+            load_xtc_frames(mol, bytes).map_err(|e| ScriptError::Command(e.to_string()))?;
+        let t_end = mol.frames.last().map_or(0.0, |f| f.time_ps);
+        self.dirty_geometry = true;
+        let msg = format!(
+            "Loaded {loaded} GROMACS .xtc frames (0.0..{t_end:.1} ps) from {source_label}."
+        );
+        self.provenance.push(ProvenanceEntry {
+            kind: ProvenanceKind::MolecularDynamics,
+            source_app: "biomolcraft::xtc-codec".to_string(),
+            summary: msg.clone(),
+        });
+        Ok(msg)
+    }
+
+    /// Detect & rank 3D druggable binding cavities on the active macromolecule (`fpocket`/CASTp-style).
+    pub fn detect_pockets(&mut self, max_pockets: usize) -> Result<String, ScriptError> {
+        let mol = self
+            .active_molecule()
+            .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+        let title = mol.title.clone();
+        let pockets = detect_binding_pockets(mol, max_pockets);
+        if pockets.is_empty() {
+            self.binding_pockets.clear();
+            self.selected_pocket_id = None;
+            self.dirty_geometry = true;
+            return Ok(format!(
+                "No buried binding pockets (> 45 Å³) detected on '{title}'."
+            ));
+        }
+
+        let mut md = format!(
+            "## 3D Druggable Binding Pockets — {title}\n\n| Rank | Druggability | Volume (Å³) | Enclosure | Hydrophobic % | Polar % | Center (Å) | Lining Residues |\n|---:|---:|---:|---:|---:|---:|:---|:---|\n"
+        );
+        for p in &pockets {
+            let preview: Vec<&str> = p
+                .lining_residues
+                .iter()
+                .take(8)
+                .map(String::as_str)
+                .collect();
+            md.push_str(&format!(
+                "| #{} | **{:.2}** | {:.0} | {:.0}% | {:.0}% | {:.0}% | `[{:.1}, {:.1}, {:.1}]` | {} |\n",
+                p.pocket_id,
+                p.druggability_score,
+                p.volume_a3,
+                p.enclosure * 100.0,
+                p.hydrophobic_fraction * 100.0,
+                p.polar_fraction * 100.0,
+                p.center[0],
+                p.center[1],
+                p.center[2],
+                preview.join(", ")
+            ));
+        }
+        let top = &pockets[0];
+        let gb = GridBox3D {
+            center: top.center,
+            size: top.size,
+            spacing: 0.375,
+        };
+        let msg = format!(
+            "Detected {} binding pocket(s) on '{title}'. Top #1: druggability={:.2}, vol={:.0} Å³, enc={:.0}%, center=[{:.1},{:.1},{:.1}] (GridBox synced).",
+            pockets.len(),
+            top.druggability_score,
+            top.volume_a3,
+            top.enclosure * 100.0,
+            top.center[0],
+            top.center[1],
+            top.center[2]
+        );
+        self.binding_pockets = pockets;
+        self.selected_pocket_id = Some(1);
+        self.render_opts.grid_box = Some(gb);
+        if let Some(ref mut vd) = self.viewdock {
+            vd.editable_grid_box = Some(gb);
+            vd.show_grid_box = true;
+        }
+        self.sync_active_render_opts();
+        self.last_module_markdown = md;
+        self.provenance.push(ProvenanceEntry {
+            kind: ProvenanceKind::ComputationalPrediction,
+            source_app: "biomolcraft::pockets-3d".to_string(),
+            summary: msg.clone(),
+        });
+        self.dirty_geometry = true;
+        Ok(msg)
+    }
+
+    /// Highlight detected pocket `#rank` (1-based), snap active `DockCraft` `GridBox3D`, and focus camera.
+    pub fn select_pocket_gridbox(&mut self, rank: usize) -> Result<String, ScriptError> {
+        let Some(p) = self
+            .binding_pockets
+            .iter()
+            .find(|p| p.pocket_id == rank)
+            .cloned()
+        else {
+            return Err(ScriptError::Command(format!(
+                "binding pocket #{rank} not found (run `pockets` first; {} detected)",
+                self.binding_pockets.len()
+            )));
+        };
+        let gb = GridBox3D {
+            center: p.center,
+            size: p.size,
+            spacing: 0.375,
+        };
+        self.selected_pocket_id = Some(p.pocket_id);
+        self.render_opts.grid_box = Some(gb);
+        if let Some(ref mut vd) = self.viewdock {
+            vd.editable_grid_box = Some(gb);
+            vd.show_grid_box = true;
+        }
+        let rad = (p.size[0].max(p.size[1]).max(p.size[2]) * 0.72).max(10.0);
+        self.camera.focus_on_bounds(p.center, rad);
+        self.sync_active_render_opts();
+        self.dirty_geometry = true;
+        Ok(format!(
+            "Pocket #{} selected (drug={:.2}, vol={:.0} Å³): GridBox synced -> center=[{:.2},{:.2},{:.2}] size=[{:.1},{:.1},{:.1}] Å.",
+            p.pocket_id,
+            p.druggability_score,
+            p.volume_a3,
+            gb.center[0],
+            gb.center[1],
+            gb.center[2],
+            gb.size[0],
+            gb.size[1],
+            gb.size[2]
+        ))
     }
 
     fn parse_model_id_arg(s: &str) -> Option<u32> {
@@ -1776,6 +1945,23 @@ impl BiomolSession {
                     self.render_opts.ssao_strength
                 ))
             }
+            "shadows" | "shadow" => {
+                let low = rest.to_ascii_lowercase();
+                let val = match low.as_str() {
+                    "" | "on" | "true" => 0.65_f32,
+                    "off" | "false" | "none" => 0.0_f32,
+                    _ => rest.parse::<f32>().map_err(|_| {
+                        ScriptError::Command("usage: shadows <on|off|0.0..1.0>".to_string())
+                    })?,
+                };
+                self.render_opts.shadow_strength = val.clamp(0.0, 1.0);
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                Ok(format!(
+                    "Directional PCF 3x3 soft shadows set to {:.2}.",
+                    self.render_opts.shadow_strength
+                ))
+            }
             "bg" | "background" => {
                 match rest.to_ascii_lowercase().as_str() {
                     "white" | "light" => {
@@ -2026,6 +2212,25 @@ impl BiomolSession {
                     "GridBox set to center={:?}, size={:?} Å.",
                     gb.center, gb.size
                 ))
+            }
+            "pockets" | "cavities" => {
+                let low = rest.to_ascii_lowercase();
+                if matches!(low.as_str(), "off" | "clear" | "hide" | "none") {
+                    self.binding_pockets.clear();
+                    self.selected_pocket_id = None;
+                    self.dirty_geometry = true;
+                    return Ok("Cleared 3D binding pocket meshes.".to_string());
+                }
+                let max_n = if low.is_empty() || low == "on" {
+                    6usize
+                } else {
+                    low.parse::<usize>().unwrap_or(6).clamp(1, 16)
+                };
+                self.detect_pockets(max_n)
+            }
+            "pocket_box" => {
+                let rank: usize = rest.trim().trim_start_matches('#').parse().unwrap_or(1);
+                self.select_pocket_gridbox(rank)
             }
             "select" | "sele" => {
                 let mol = self
@@ -2418,23 +2623,37 @@ impl BiomolSession {
             "load_dcd" => {
                 if rest.is_empty() {
                     return Err(ScriptError::Command(
-                        "usage: load_dcd <trajectory.dcd>".to_string(),
+                        "usage: load_dcd <trajectory.dcd|trajectory.xtc>".to_string(),
                     ));
                 }
-                let bytes = std::fs::read(rest)?;
+                let clean = rest.trim_matches('"');
+                let bytes = std::fs::read(clean)?;
+                if clean.to_ascii_lowercase().ends_with(".xtc") {
+                    return self.load_xtc_bytes(&bytes, clean);
+                }
                 let mol = self
                     .active_molecule_mut()
                     .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
                 let loaded = load_dcd_frames(mol, &bytes)
                     .map_err(|e| ScriptError::Command(e.to_string()))?;
                 self.dirty_geometry = true;
-                let msg = format!("Loaded {loaded} binary DCD trajectory frames from {rest}.");
+                let msg = format!("Loaded {loaded} binary DCD trajectory frames from {clean}.");
                 self.provenance.push(ProvenanceEntry {
                     kind: ProvenanceKind::MolecularDynamics,
                     source_app: "biomolcraft::dcd-loader".to_string(),
                     summary: msg.clone(),
                 });
                 Ok(msg)
+            }
+            "load_xtc" => {
+                if rest.is_empty() {
+                    return Err(ScriptError::Command(
+                        "usage: load_xtc <trajectory.xtc>".to_string(),
+                    ));
+                }
+                let clean = rest.trim_matches('"');
+                let bytes = std::fs::read(clean)?;
+                self.load_xtc_bytes(&bytes, clean)
             }
             "tunnels" => self.execute_single_cmd("module enzymes"),
             "molmap" => {
@@ -4009,6 +4228,87 @@ $$$$
 
         let _ = std::fs::remove_file(&zip_path);
         let _ = std::fs::remove_dir_all(&push_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn wave8_shadows_xtc_pockets_and_session_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        use craftbio_struct::{TrajectoryFrame, write_xtc_frames};
+
+        // Synthetic hollow protein shell with a buried cavity around origin
+        let mut pdb = String::new();
+        let mut serial = 1usize;
+        let mut res_seq = 1i32;
+        for iz in -6..=6i32 {
+            for iy in -6..=6i32 {
+                for ix in -6..=6i32 {
+                    let x = ix as f64 * 2.2;
+                    let y = iy as f64 * 2.2;
+                    let z = iz as f64 * 2.2;
+                    let r = (x * x + y * y + z * z).sqrt();
+                    let is_mouth = z > 4.5 && (x * x + y * y).sqrt() < 2.8;
+                    if (5.6..=10.0).contains(&r) && !is_mouth {
+                        pdb.push_str(&format!(
+                            "ATOM  {:5}  CA  PHE A{:4}    {:8.3}{:8.3}{:8.3}  1.00 20.00           C\n",
+                            serial, res_seq, x, y, z
+                        ));
+                        serial += 1;
+                        res_seq += 1;
+                    }
+                }
+            }
+        }
+        pdb.push_str("END\n");
+
+        let mut sess = BiomolSession::default();
+        sess.load_structure_text("pocket_host", &pdb, None)?;
+
+        // 1. Directional soft shadows DSL
+        let sh_msg = sess.execute_dsl("shadows 0.78")?;
+        assert!(sh_msg.contains("0.78"));
+        assert!((sess.render_opts.shadow_strength - 0.78).abs() < 1e-4);
+
+        // 2. 3D Binding pocket detection + pocket_box GridBox sync
+        let p_msg = sess.execute_dsl("pockets 4")?;
+        assert!(p_msg.contains("Detected"));
+        assert!(!sess.binding_pockets.is_empty());
+        let pb_msg = sess.execute_dsl("pocket_box 1")?;
+        assert!(pb_msg.contains("GridBox synced"));
+        assert!(sess.current_selection_box_snapshot(4.0).is_some());
+
+        // 3. Pure-Rust GROMACS .xtc write & load via DSL
+        if let Some(mol) = sess.active_molecule_mut() {
+            let base: Vec<[f64; 3]> = mol.atoms.iter().map(|a| a.coords).collect();
+            let shifted: Vec<[f64; 3]> = base.iter().map(|c| [c[0] + 0.5, c[1], c[2]]).collect();
+            mol.frames = vec![
+                TrajectoryFrame {
+                    frame_index: 0,
+                    time_ps: 0.0,
+                    coords: base,
+                },
+                TrajectoryFrame {
+                    frame_index: 1,
+                    time_ps: 12.5,
+                    coords: shifted,
+                },
+            ];
+        }
+        let xtc_bytes = write_xtc_frames(sess.active_molecule().ok_or("missing mol")?, 1000.0)?;
+        let xtc_path =
+            std::env::temp_dir().join(format!("biomol_w8_traj_{}.xtc", std::process::id()));
+        std::fs::write(&xtc_path, &xtc_bytes)?;
+        let xtc_msg = sess.execute_dsl(&format!("load_xtc {}", xtc_path.display()))?;
+        assert!(xtc_msg.contains("Loaded 2 GROMACS .xtc frames"));
+        let _ = std::fs::remove_file(&xtc_path);
+
+        // 4. Verify shadow_strength & binding_pockets roundtrip inside .biomol.zip!
+        let (zip_bytes, _) = encode_session_zip_bytes(&sess)?;
+        let (restored, _) = decode_session_zip_bytes(&zip_bytes)?;
+        assert!((restored.render_opts.shadow_strength - 0.78).abs() < 1e-4);
+        assert_eq!(restored.binding_pockets.len(), sess.binding_pockets.len());
+        let sc = restored.build_viewport_scene();
+        assert!((sc.shadow_strength - 0.78).abs() < 1e-4);
+        assert!(!sc.transparent_meshes.is_empty());
         Ok(())
     }
 }
