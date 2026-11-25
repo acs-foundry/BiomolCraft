@@ -12,10 +12,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use biomol_model::{
-    add_polar_hydrogens_ph, audit_structure_prep, build_de_novo_peptide_3d,
-    build_de_novo_rna_helix_3d, combine_biomolecules, delete_atoms_by_mask, minimize_local_mm,
-    mutate_and_repack_best_rotamer, mutate_residue_3d, rename_chain, renumber_chain,
-    rotate_bond_torsion, swapna_nucleotide_3d, tug_atom_with_sculpting,
+    Aggregation3DReport, RamachandranReport, RotamerTableReport, add_polar_hydrogens_ph,
+    aggregation_visual_palette, analyze_aggregation_3d, analyze_ramachandran, audit_structure_prep,
+    build_de_novo_peptide_3d, build_de_novo_rna_helix_3d, combine_biomolecules,
+    delete_atoms_by_mask, enumerate_rotamers_3d, inspect_structure_info, minimize_local_mm,
+    mutate_and_repack_best_rotamer, mutate_residue_3d, parse_aa_code, rename_chain,
+    render_aggregation_markdown, render_info_markdown, render_ramachandran_markdown,
+    render_rotamers_markdown, renumber_chain, rotate_bond_torsion, simulate_solubility_rescue,
+    swapna_nucleotide_3d, tug_atom_with_sculpting,
 };
 use biomol_modules::{
     run_adc_module, run_antibody_module, run_cryoem_molmap_module, run_cryoem_volume_module,
@@ -34,8 +38,9 @@ use craftbio_scene::{
 use craftbio_struct::{
     BindingPocket3D, Biomolecule, GeometryAxis, GeometryPlane, MsaAlignment, PaeMatrix,
     ResidueClass, VolumeGrid3D, axis_angle_deg, build_synchronized_msa, cealign_superpose,
-    compute_best_fit_plane, compute_geometry_axis, detect_binding_pockets, detect_clashes,
-    detect_contacts, detect_hbonds, detect_snfg_glycans, estimate_pae_proxy_from_structure,
+    compute_best_fit_plane, compute_geometry_axis, compute_selection_sasa, detect_binding_pockets,
+    detect_clashes, detect_clashes_between, detect_contacts, detect_contacts_between,
+    detect_hbonds, detect_hbonds_between, detect_snfg_glycans, estimate_pae_proxy_from_structure,
     evaluate_selection, generate_biological_assembly, generate_crystal_mates, load_dcd_frames,
     load_xtc_frames, matchmaker_align, measure_angle_deg, measure_dihedral_deg, measure_distance,
     morph_biomolecules, parse_dx_map, parse_mrc_map, parse_pae_json, parse_sdf_poses,
@@ -274,6 +279,17 @@ pub struct ViewDockSession {
     pub editable_grid_box: Option<GridBox3D>,
 }
 
+#[derive(Debug, Clone)]
+struct InteractionQuery {
+    cutoff: f64,
+    model_a: Option<u32>,
+    expr_a: Option<String>,
+    model_b: Option<u32>,
+    expr_b: Option<String>,
+    inter_model: bool,
+    intra_model: bool,
+}
+
 /// Complete stateful multi-model `BiomolCraft` interactive session (shared by GUI, CLI & MCP).
 #[derive(Debug, Clone)]
 pub struct BiomolSession {
@@ -299,6 +315,9 @@ pub struct BiomolSession {
     pub planes: Vec<GeometryPlane>,
     pub msa: Option<MsaAlignment>,
     pub pae: Option<PaeMatrix>,
+    pub ramachandran: Option<RamachandranReport>,
+    pub aggregation: Option<Aggregation3DReport>,
+    pub rotamer_table: Option<RotamerTableReport>,
     pub labels_3d: Vec<Label3D>,
     pub labels_2d: Vec<Label2D>,
     pub color_key: Option<ColorKeyLegend>,
@@ -332,6 +351,9 @@ impl Default for BiomolSession {
             planes: Vec::new(),
             msa: None,
             pae: None,
+            ramachandran: None,
+            aggregation: None,
+            rotamer_table: None,
             labels_3d: Vec::new(),
             labels_2d: Vec::new(),
             color_key: None,
@@ -448,6 +470,7 @@ impl BiomolSession {
             m.render_opts.shadow_strength = g.shadow_strength;
             m.render_opts.background = g.background;
             m.render_opts.residue_highlights = g.residue_highlights;
+            m.render_opts.residue_colors = g.residue_colors;
             m.render_opts.sphere_overlays = g.sphere_overlays;
             m.render_opts.line_overlays = g.line_overlays;
             m.render_opts.selected_atoms = g.selected_atoms;
@@ -1116,7 +1139,7 @@ impl BiomolSession {
         scene
     }
 
-    /// Build a standard publication `ColorKeyLegend` matching `kind` (`esp|mlp|sap|plddt|auto`).
+    /// Build a standard publication `ColorKeyLegend` matching `kind` (`esp|mlp|sap|plddt|bfactor|rainbow|agg|auto`).
     #[must_use]
     pub fn build_color_key(&self, kind: &str) -> ColorKeyLegend {
         let mode = if kind.is_empty()
@@ -1127,6 +1150,8 @@ impl BiomolSession {
                 ColorScheme::ElectrostaticEsp => "esp",
                 ColorScheme::LipophilicityMlp => "mlp",
                 ColorScheme::Sap3D => "sap",
+                ColorScheme::CrystallographicBfactor => "bfactor",
+                ColorScheme::Rainbow => "rainbow",
                 _ => "plddt",
             }
         } else {
@@ -1151,8 +1176,38 @@ impl BiomolSession {
                 max_label: "+0.8".to_string(),
                 stops: vec![[0.42, 0.65, 0.95], [0.94, 0.94, 0.94], [0.94, 0.22, 0.15]],
             },
+            "agg" | "aggregation" | "aggrescan" => ColorKeyLegend {
+                title: "3D Aggregation Propensity".to_string(),
+                min_label: "-2.0 (Soluble)".to_string(),
+                max_label: "+2.0 (Agg-Prone)".to_string(),
+                stops: vec![[0.24, 0.54, 0.96], [0.95, 0.95, 0.95], [0.94, 0.20, 0.16]],
+            },
+            "bfactor" | "b" => {
+                let (lo, hi) = self.active_molecule().map_or((10.0, 80.0), |mol| {
+                    let info = inspect_structure_info(mol);
+                    (info.bfactor_min, info.bfactor_max.max(info.bfactor_min + 10.0))
+                });
+                ColorKeyLegend {
+                    title: "X-Ray B-Factor (A^2)".to_string(),
+                    min_label: format!("{lo:.0} (Ordered)"),
+                    max_label: format!("{hi:.0} (Mobile)"),
+                    stops: vec![[0.14, 0.38, 0.94], [0.96, 0.96, 0.96], [0.92, 0.18, 0.18]],
+                }
+            }
+            "rainbow" => ColorKeyLegend {
+                title: "Sequence (N -> C)".to_string(),
+                min_label: "N-term".to_string(),
+                max_label: "C-term".to_string(),
+                stops: vec![
+                    [0.14, 0.34, 0.92],
+                    [0.12, 0.74, 0.88],
+                    [0.24, 0.82, 0.44],
+                    [0.96, 0.82, 0.18],
+                    [0.88, 0.18, 0.22],
+                ],
+            },
             _ => ColorKeyLegend {
-                title: "pLDDT / B-Factor".to_string(),
+                title: "AlphaFold pLDDT".to_string(),
                 min_label: "50 (Low)".to_string(),
                 max_label: "100 (High)".to_string(),
                 stops: vec![
@@ -1163,6 +1218,40 @@ impl BiomolSession {
                 ],
             },
         }
+    }
+
+    /// Select and focus a single residue `(chain, res_seq)` in 3D (used by Ramachandran & Aggregation plots).
+    pub fn focus_residue_3d(&mut self, chain: char, res_seq: i32) -> String {
+        let Some(mol) = self.active_molecule() else {
+            return "No biomolecule loaded.".to_string();
+        };
+        let mut mask = vec![false; mol.atoms.len()];
+        let mut sum = [0.0_f64; 3];
+        let mut cnt = 0usize;
+        let mut rname = String::new();
+        for (i, a) in mol.atoms.iter().enumerate() {
+            if a.chain == chain && a.res_seq == res_seq {
+                mask[i] = true;
+                sum[0] += a.coords[0];
+                sum[1] += a.coords[1];
+                sum[2] += a.coords[2];
+                cnt += 1;
+                if rname.is_empty() {
+                    rname = a.res_name.clone();
+                }
+            }
+        }
+        if cnt == 0 {
+            return format!("Residue {chain}:{res_seq} not found.");
+        }
+        let center = [sum[0] / cnt as f64, sum[1] / cnt as f64, sum[2] / cnt as f64];
+        self.render_opts.selected_atoms = mask.clone();
+        self.named_selections.insert("sele".to_string(), mask.clone());
+        self.named_selections.insert("sel".to_string(), mask);
+        self.camera.focus_on_bounds(center, 11.0);
+        self.sync_active_render_opts();
+        self.dirty_geometry = true;
+        format!("Selected & focused {chain}:{rname}{res_seq} ({cnt} atoms).")
     }
 
     fn resolve_atom_spec(&self, spec: &str) -> Result<(usize, String, [f64; 3]), ScriptError> {
@@ -1667,6 +1756,200 @@ impl BiomolSession {
         s.trim().trim_start_matches('#').parse::<u32>().ok()
     }
 
+    fn run_sasa_query(&mut self, expr: &str) -> Result<String, ScriptError> {
+        let mol = self
+            .active_molecule()
+            .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?
+            .clone();
+        let trimmed = expr.trim();
+        let (label, target_mask) = if !trimmed.is_empty() {
+            let m = evaluate_selection(&mol, trimmed, &self.named_selections)
+                .map_err(|e| ScriptError::Command(e.to_string()))?;
+            (trimmed.to_string(), m)
+        } else if self.render_opts.selected_atoms.iter().any(|&b| b) {
+            ("selection".to_string(), self.render_opts.selected_atoms.clone())
+        } else if mol.atoms.iter().any(|a| a.res_class == ResidueClass::Ligand) {
+            let m: Vec<bool> = mol
+                .atoms
+                .iter()
+                .map(|a| a.res_class == ResidueClass::Ligand)
+                .collect();
+            ("ligand".to_string(), m)
+        } else {
+            let m: Vec<bool> = mol
+                .atoms
+                .iter()
+                .map(|a| a.res_class != ResidueClass::Water)
+                .collect();
+            ("all (non-water)".to_string(), m)
+        };
+
+        let rep = compute_selection_sasa(&mol, &target_mask, None);
+        if rep.atom_count == 0 {
+            return Err(ScriptError::Command(format!(
+                "sasa: selection '{label}' matched 0 atoms"
+            )));
+        }
+        let msg = format!(
+            "SASA ('{label}', {} atoms): isolated = {:.1} Å², in complex = {:.1} Å², buried ΔSASA = {:.1} Å² ({:.1}% buried).",
+            rep.atom_count,
+            rep.isolated_sasa_a2,
+            rep.complex_sasa_a2,
+            rep.buried_sasa_a2,
+            rep.buried_fraction_pct
+        );
+        self.last_module_markdown = format!(
+            "## Solvent-Accessible Surface Area (`sasa`)\n\n- **Target:** `{label}` (`{}` atoms)\n- **Isolated SASA (alone):** `{:.2} Å²`\n- **Complex SASA (bound):** `{:.2} Å²`\n- **Buried Surface (`ΔSASA`):** `{:.2} Å²` (**`{:.1}%` buried**)\n",
+            rep.atom_count,
+            rep.isolated_sasa_a2,
+            rep.complex_sasa_a2,
+            rep.buried_sasa_a2,
+            rep.buried_fraction_pct
+        );
+        self.measurements_log.push(msg.clone());
+        Ok(msg)
+    }
+
+    fn parse_interaction_query(rest: &str, default_cutoff: f64) -> InteractionQuery {
+        let mut cutoff = default_cutoff;
+        let mut inter_model = false;
+        let mut intra_model = true;
+        let mut inter_explicit = false;
+        let mut clean_tokens: Vec<String> = Vec::new();
+        let raw: Vec<&str> = rest.split_whitespace().collect();
+        let mut i = 0usize;
+        while i < raw.len() {
+            let tok = raw[i];
+            let low = tok.to_ascii_lowercase();
+            if low == "intermodel" {
+                if let Some(v) = raw.get(i + 1) {
+                    inter_model = matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "on" | "yes");
+                    inter_explicit = true;
+                    i += 2;
+                    continue;
+                }
+            } else if low == "intramodel" {
+                if let Some(v) = raw.get(i + 1) {
+                    intra_model = matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "on" | "yes");
+                    i += 2;
+                    continue;
+                }
+            } else if low == "reveal" || low == "log" {
+                if raw.get(i + 1).is_some() {
+                    i += 2;
+                    continue;
+                }
+            } else if clean_tokens.is_empty()
+                && let Ok(val) = tok.parse::<f64>()
+            {
+                cutoff = val;
+                i += 1;
+                continue;
+            }
+            clean_tokens.push(tok.to_string());
+            i += 1;
+        }
+
+        // Split on `restrict` keyword if present
+        let split_pos = clean_tokens
+            .iter()
+            .position(|t| t.eq_ignore_ascii_case("restrict"));
+        let (left, right) = if let Some(p) = split_pos {
+            (&clean_tokens[..p], Some(&clean_tokens[p + 1..]))
+        } else {
+            (clean_tokens.as_slice(), None)
+        };
+
+        let parse_side = |toks: &[String]| -> (Option<u32>, Option<String>) {
+            if toks.is_empty() {
+                return (None, None);
+            }
+            if toks[0].starts_with('#')
+                && let Some(mid) = Self::parse_model_id_arg(&toks[0])
+            {
+                let expr = toks[1..].join(" ");
+                return (Some(mid), (!expr.trim().is_empty()).then_some(expr));
+            }
+            let expr = toks.join(" ");
+            (None, (!expr.trim().is_empty()).then_some(expr))
+        };
+
+        let (model_a, expr_a) = parse_side(left);
+        let (model_b, expr_b) = right.map(parse_side).unwrap_or((None, None));
+        if !inter_explicit
+            && let (Some(ma), Some(mb)) = (model_a, model_b)
+            && ma != mb
+        {
+            inter_model = true;
+            intra_model = false;
+        }
+
+        InteractionQuery {
+            cutoff,
+            model_a,
+            expr_a,
+            model_b,
+            expr_b,
+            inter_model,
+            intra_model,
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn resolve_interaction_targets(
+        &self,
+        q: &InteractionQuery,
+    ) -> Result<(Biomolecule, Option<Vec<bool>>, Option<Biomolecule>, Option<Vec<bool>>), ScriptError> {
+        let mol_a = if let Some(mid) = q.model_a {
+            self.models
+                .iter()
+                .find(|m| m.model_id == mid)
+                .map(|m| m.molecule.clone())
+                .ok_or_else(|| ScriptError::Command(format!("model #{mid} not found")))?
+        } else {
+            self.active_molecule()
+                .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?
+                .clone()
+        };
+        let mask_a = match q.expr_a.as_deref() {
+            Some(e) => Some(
+                evaluate_selection(&mol_a, e, &self.named_selections)
+                    .map_err(|err| ScriptError::Command(err.to_string()))?,
+            ),
+            None => None,
+        };
+        if let Some(mb_id) = q.model_b {
+            let mol_b = self
+                .models
+                .iter()
+                .find(|m| m.model_id == mb_id)
+                .map(|m| m.molecule.clone())
+                .ok_or_else(|| ScriptError::Command(format!("model #{mb_id} not found")))?;
+            let mask_b = match q.expr_b.as_deref() {
+                Some(e) => Some(
+                    evaluate_selection(&mol_b, e, &self.named_selections)
+                        .map_err(|err| ScriptError::Command(err.to_string()))?,
+                ),
+                None => None,
+            };
+            Ok((mol_a, mask_a, Some(mol_b), mask_b))
+        } else {
+            let mask_b = match q.expr_b.as_deref() {
+                Some(e) => Some(
+                    evaluate_selection(&mol_a, e, &self.named_selections)
+                        .map_err(|err| ScriptError::Command(err.to_string()))?,
+                ),
+                None => {
+                    // When only one selection is given (e.g. `hbonds ligand`), check it against complement!
+                    mask_a
+                        .as_ref()
+                        .map(|ma| ma.iter().map(|&v| !v).collect::<Vec<bool>>())
+                }
+            };
+            Ok((mol_a, mask_a, None, mask_b))
+        }
+    }
+
     /// Execute one or more semicolon-separated PyMOL/ChimeraX-compatible DSL commands.
     pub fn execute_dsl(&mut self, script: &str) -> Result<String, ScriptError> {
         let mut responses = Vec::new();
@@ -1778,8 +2061,46 @@ impl BiomolSession {
                     ))
                 } else {
                     let msg = self.add_structure_file(&asset.local_path)?;
+                    let mut extra = String::new();
+                    if asset.provider == "AlphaFoldDB" {
+                        self.render_opts.color_scheme = ColorScheme::BfactorPlddt;
+                        self.render_opts.residue_colors.clear();
+                        self.sync_active_render_opts();
+                        if let Some(mol) = self.active_molecule() {
+                            let cas: Vec<f64> = mol
+                                .atoms
+                                .iter()
+                                .filter(|a| a.name == "CA" && a.res_class == ResidueClass::Protein)
+                                .map(|a| a.b_factor)
+                                .collect();
+                            if !cas.is_empty() {
+                                let vhi = cas.iter().filter(|&&b| b >= 90.0).count();
+                                let hi = cas.iter().filter(|&&b| (70.0..90.0).contains(&b)).count();
+                                let lo = cas.iter().filter(|&&b| (50.0..70.0).contains(&b)).count();
+                                let vlo = cas.iter().filter(|&&b| b < 50.0).count();
+                                extra.push_str(&format!(
+                                    " | pLDDT Cα ({}): >=90: {vhi}, 70-90: {hi}, 50-70: {lo}, <50: {vlo}",
+                                    cas.len()
+                                ));
+                            }
+                        }
+                        if let Some(ref pae_path) = asset.pae_path
+                            && let Ok(raw) = std::fs::read_to_string(pae_path)
+                            && let Ok(pae) = parse_pae_json(&asset.canonical_id, &raw)
+                        {
+                            extra.push_str(&format!(
+                                " | PAE auto-loaded ({}x{}, mean {:.1} Å, {} rigid domains)",
+                                pae.length,
+                                pae.length,
+                                pae.mean_pae,
+                                pae.domain_blocks.len()
+                            ));
+                            self.pae = Some(pae);
+                        }
+                        self.dirty_geometry = true;
+                    }
                     Ok(format!(
-                        "Fetched {} {} ({tag}) -> {msg}",
+                        "Fetched {} {} ({tag}) -> {msg}{extra}",
                         asset.provider, asset.canonical_id
                     ))
                 }
@@ -2044,20 +2365,30 @@ impl BiomolSession {
                     "ss" | "dssp" | "secondary" => ColorScheme::SecondaryStructure,
                     "cpk" | "elem" | "element" => ColorScheme::ElementCpk,
                     "nucleotide" | "rna" | "base" => ColorScheme::Nucleotide,
-                    "plddt" | "bfactor" | "b" => ColorScheme::BfactorPlddt,
+                    "rainbow" | "spectrum" => ColorScheme::Rainbow,
+                    "bfactor" | "b" => ColorScheme::CrystallographicBfactor,
+                    "plddt" => ColorScheme::BfactorPlddt,
                     "sap" => ColorScheme::Sap3D,
                     "esp" | "electrostatic" => ColorScheme::ElectrostaticEsp,
                     "mlp" | "lipophilicity" => ColorScheme::LipophilicityMlp,
                     other => {
                         return Err(ScriptError::Command(format!(
-                            "unknown color scheme '{other}' (use chain|ss|cpk|nucleotide|plddt|sap|esp|mlp)"
+                            "unknown color scheme '{other}' (use chain|ss|cpk|nucleotide|rainbow|bfactor|plddt|sap|esp|mlp)"
                         )));
                     }
                 };
                 self.render_opts.color_scheme = c;
+                self.render_opts.residue_colors.clear();
                 self.sync_active_render_opts();
                 self.dirty_geometry = true;
                 Ok(format!("Color scheme set to {}.", c.label()))
+            }
+            "rainbow" => {
+                self.render_opts.color_scheme = ColorScheme::Rainbow;
+                self.render_opts.residue_colors.clear();
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                Ok("Colored polymer chains by N->C Rainbow (ligands kept CPK).".to_string())
             }
             "surface" => {
                 let low = rest.to_ascii_lowercase();
@@ -2074,6 +2405,66 @@ impl BiomolSession {
                 self.sync_active_render_opts();
                 self.dirty_geometry = true;
                 Ok(format!("Smooth SES triangulated surface: {on}."))
+            }
+            "transparency" | "opacity" => {
+                let val_tok = rest.split_whitespace().next().unwrap_or("");
+                let raw: f32 = val_tok.parse().map_err(|_| {
+                    ScriptError::Command("usage: transparency <0..100> (e.g. transparency 60)".to_string())
+                })?;
+                let alpha = if cmd == "opacity" {
+                    if raw > 1.0 {
+                        (raw / 100.0).clamp(0.05, 1.0)
+                    } else {
+                        raw.clamp(0.05, 1.0)
+                    }
+                } else {
+                    (1.0 - raw.clamp(0.0, 95.0) / 100.0).clamp(0.05, 1.0)
+                };
+                self.render_opts.surface_alpha = alpha;
+                if alpha < 0.99 {
+                    self.render_opts.show_surface_shell = true;
+                }
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                Ok(format!(
+                    "Surface transparency set to {:.0}% (alpha = {:.2}).",
+                    (1.0 - alpha) * 100.0,
+                    alpha
+                ))
+            }
+            "sticks" | "pocket_sticks" => {
+                if rest.is_empty()
+                    || matches!(rest.to_ascii_lowercase().as_str(), "clear" | "off" | "none")
+                {
+                    self.render_opts.residue_highlights.clear();
+                    self.sync_active_render_opts();
+                    self.dirty_geometry = true;
+                    return Ok("Cleared selective pocket/residue sticks.".to_string());
+                }
+                let mol = self
+                    .active_molecule()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?
+                    .clone();
+                let mask = evaluate_selection(&mol, rest, &self.named_selections)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                let mut res_set = std::collections::BTreeSet::new();
+                for (i, &hit) in mask.iter().enumerate() {
+                    if hit {
+                        let a = &mol.atoms[i];
+                        res_set.insert((a.chain, a.res_seq));
+                    }
+                }
+                for &(ch, rs) in &res_set {
+                    self.render_opts
+                        .residue_highlights
+                        .insert((ch, rs), [0.76, 0.78, 0.82]);
+                }
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                Ok(format!(
+                    "Displayed sticks for {} residue(s) matching '{rest}' over active representation.",
+                    res_set.len()
+                ))
             }
             "silhouettes" => {
                 let on = matches!(rest.to_ascii_lowercase().as_str(), "on" | "true" | "1" | "");
@@ -2244,21 +2635,244 @@ impl BiomolSession {
                 let mask = evaluate_selection(mol, expr, &self.named_selections)
                     .map_err(|e| ScriptError::Command(e.to_string()))?;
                 let count = mask.iter().filter(|&&b| b).count();
+                let mut res_set = std::collections::HashSet::new();
+                for (i, &hit) in mask.iter().enumerate() {
+                    if hit {
+                        res_set.insert((mol.atoms[i].chain, mol.atoms[i].res_seq));
+                    }
+                }
                 self.render_opts.selected_atoms = mask.clone();
-                self.named_selections.insert(name.clone(), mask);
+                self.named_selections.insert(name.clone(), mask.clone());
+                self.named_selections.insert("sel".to_string(), mask);
                 self.sync_active_render_opts();
                 self.dirty_geometry = true;
-                Ok(format!("Selection '{name}' matched {count} atoms."))
+                Ok(format!(
+                    "Selection '{name}' matched {count} atoms ({} residues).",
+                    res_set.len()
+                ))
             }
-            "mutate" => {
+            "info" => {
+                let mol = self
+                    .active_molecule()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?
+                    .clone();
+                let mut parts = rest.splitn(2, char::is_whitespace);
+                let sub = parts.next().unwrap_or("summary").trim();
+                let tail = parts.next().unwrap_or("").trim();
+                let mask = if !tail.is_empty() {
+                    Some(
+                        evaluate_selection(&mol, tail, &self.named_selections)
+                            .map_err(|e| ScriptError::Command(e.to_string()))?,
+                    )
+                } else if matches!(sub.to_ascii_lowercase().as_str(), "residues" | "atoms")
+                    && !self.render_opts.selected_atoms.is_empty()
+                    && self.render_opts.selected_atoms.iter().any(|&b| b)
+                {
+                    Some(self.render_opts.selected_atoms.clone())
+                } else {
+                    None
+                };
+                let md = render_info_markdown(&mol, sub, mask.as_deref());
+                let rep = inspect_structure_info(&mol);
+                self.last_module_markdown = md;
+                Ok(format!(
+                    "info {sub}: {} chains, {} atoms, {} internal gap(s), {} truncated sidechain(s), B-factor {:.1}/{:.1}/{:.1} Å².",
+                    rep.chains.len(),
+                    rep.total_atoms,
+                    rep.missing_gaps.len(),
+                    rep.truncated_sidechains.len(),
+                    rep.bfactor_min,
+                    rep.bfactor_median,
+                    rep.bfactor_max
+                ))
+            }
+            "sasa" => self.run_sasa_query(rest),
+            "ramachandran" | "rama" => {
+                let mol = self
+                    .active_molecule()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?
+                    .clone();
+                let low = rest.trim().to_ascii_lowercase();
+                let highlight_outliers = low.contains("outlier");
+                let chain_filter = rest
+                    .split_whitespace()
+                    .find(|t| t.len() == 1 && t.chars().all(|c| c.is_ascii_alphabetic()))
+                    .and_then(|t| t.chars().next())
+                    .map(|c| c.to_ascii_uppercase());
+                let rep = analyze_ramachandran(&mol, chain_filter);
+                let md = render_ramachandran_markdown(&rep);
+                if highlight_outliers {
+                    for p in &rep.points {
+                        if p.region == biomol_model::RamaRegion::Outlier {
+                            self.render_opts
+                                .residue_highlights
+                                .insert((p.chain, p.res_seq), [0.98, 0.16, 0.72]);
+                        }
+                    }
+                    self.sync_active_render_opts();
+                    self.dirty_geometry = true;
+                }
+                let msg = format!(
+                    "Ramachandran ({} residues): {:.1}% favored ({}), {:.1}% allowed ({}), {:.1}% outliers ({}), {} cis-peptides.",
+                    rep.points.len(),
+                    rep.favored_pct,
+                    rep.favored_count,
+                    rep.allowed_pct,
+                    rep.allowed_count,
+                    rep.outlier_pct,
+                    rep.outlier_count,
+                    rep.cis_peptide_count
+                );
+                self.ramachandran = Some(rep);
+                self.last_module_markdown = md;
+                self.measurements_log.push(msg.clone());
+                Ok(msg)
+            }
+            "aggregation" | "agg" | "aggrescan" => {
+                let mol = self
+                    .active_molecule()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?
+                    .clone();
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                if toks
+                    .first()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("rescue"))
+                {
+                    if toks.len() < 3 {
+                        return Err(ScriptError::Command(
+                            "usage: aggregation rescue <CHAIN:RESSEQ> <AA1|AA3> [dynamic]"
+                                .to_string(),
+                        ));
+                    }
+                    let (c_s, r_s) = toks[1].split_once(':').ok_or_else(|| {
+                        ScriptError::Command("expected CHAIN:RESSEQ (e.g. A:42)".to_string())
+                    })?;
+                    let ch = c_s
+                        .chars()
+                        .next()
+                        .ok_or_else(|| ScriptError::Command("missing chain id".to_string()))?;
+                    let rseq: i32 = r_s
+                        .parse()
+                        .map_err(|_| ScriptError::Command("bad residue number".to_string()))?;
+                    let aa = parse_aa_code(toks[2]).ok_or_else(|| {
+                        ScriptError::Command(format!("invalid amino acid '{}'", toks[2]))
+                    })?;
+                    let dyn_mode = toks.iter().any(|t| t.eq_ignore_ascii_case("dynamic"));
+                    let res = simulate_solubility_rescue(&mol, ch, rseq, aa, dyn_mode)
+                        .map_err(|e| ScriptError::Command(e.to_string()))?;
+                    let msg = format!(
+                        "Solubility rescue {ch}:{}{rseq}{}: avg {:+.3} -> {:+.3} (Δ {:+.3}), max {:+.3} -> {:+.3}, res {:+.3} -> {:+.3} ({} clashes). Note: {}",
+                        res.wild_type,
+                        res.mutant,
+                        res.before_avg_score,
+                        res.after_avg_score,
+                        res.delta_avg_score,
+                        res.before_max_score,
+                        res.after_max_score,
+                        res.before_res_score,
+                        res.after_res_score,
+                        res.clashes_introduced,
+                        res.caveat
+                    );
+                    self.last_module_markdown = format!(
+                        "## Solubility Rescue Simulation: `{ch}:{}{rseq}{}`\n\n- **Global Avg Score:** `{:+.3}` → `{:+.3}` (`Δ {:+.3}`)\n- **Peak Score:** `{:+.3}` → `{:+.3}`\n- **Mutated Residue Score:** `{:+.3}` → `{:+.3}`\n- **Steric Clashes Introduced:** `{}`\n- **Scientific Trade-Off Caveat:** {}\n",
+                        res.wild_type,
+                        res.mutant,
+                        res.before_avg_score,
+                        res.after_avg_score,
+                        res.delta_avg_score,
+                        res.before_max_score,
+                        res.after_max_score,
+                        res.before_res_score,
+                        res.after_res_score,
+                        res.clashes_introduced,
+                        res.caveat
+                    );
+                    self.measurements_log.push(msg.clone());
+                    return Ok(msg);
+                }
+
+                let dynamic_mode = toks.iter().any(|t| t.eq_ignore_ascii_case("dynamic"));
+                let rep = analyze_aggregation_3d(&mol, dynamic_mode);
+                let visuals = aggregation_visual_palette(&rep);
+                let md = render_aggregation_markdown(&rep);
+                self.render_opts.residue_colors = visuals.residue_colors;
+                self.render_opts
+                    .sphere_overlays
+                    .retain(|s| s.category != "AggregationPatch");
+                self.render_opts
+                    .sphere_overlays
+                    .extend(visuals.patch_spheres);
+                self.color_key = Some(self.build_color_key("agg"));
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                let msg = format!(
+                    "3D Aggregation ({}): avg {:+.3}, max {:+.3}, {} exposed hotspots (>0.50), {} 3D patch(es).",
+                    if dynamic_mode { "dynamic" } else { "static" },
+                    rep.avg_score,
+                    rep.max_score,
+                    rep.hotspot_count,
+                    rep.patches.len()
+                );
+                self.aggregation = Some(rep);
+                self.last_module_markdown = md;
+                self.measurements_log.push(msg.clone());
+                self.provenance.push(ProvenanceEntry {
+                    kind: ProvenanceKind::ComputationalPrediction,
+                    source_app: "biomolcraft::aggregation-3d".to_string(),
+                    summary: msg.clone(),
+                });
+                Ok(msg)
+            }
+            "clone" | "duplicate" => {
+                if self.models.is_empty() {
+                    return Err(ScriptError::Command("no biomolecule loaded".to_string()));
+                }
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                let (src_idx, custom_name) = if let Some(first) = toks.first()
+                    && first.starts_with('#')
+                {
+                    let id = Self::parse_model_id_arg(first)
+                        .ok_or_else(|| ScriptError::Command("bad model id".to_string()))?;
+                    let idx = self
+                        .models
+                        .iter()
+                        .position(|m| m.model_id == id)
+                        .ok_or_else(|| ScriptError::Command(format!("model #{id} not found")))?;
+                    let nm = toks.get(1).copied();
+                    (idx, nm)
+                } else {
+                    (self.active_model_idx, toks.first().copied())
+                };
+                let src = self.models[src_idx].clone();
+                let new_id = self.next_model_id;
+                self.next_model_id += 1;
+                let new_name = custom_name
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{}_copy", src.name));
+                let mut cloned = src;
+                cloned.model_id = new_id;
+                cloned.name = new_name.clone();
+                cloned.role = "clone".to_string();
+                cloned.undo_stack.clear();
+                cloned.redo_stack.clear();
+                self.models.push(cloned);
+                self.dirty_geometry = true;
+                Ok(format!(
+                    "Cloned #{} into #{new_id} '{new_name}' (active model remains #{}).",
+                    self.models[src_idx].model_id,
+                    self.models[self.active_model_idx].model_id
+                ))
+            }
+            "rotamers" => {
                 let toks: Vec<&str> = rest.split_whitespace().collect();
                 if toks.len() < 2 {
                     return Err(ScriptError::Command(
-                        "usage: mutate <CHAIN:RESSEQ> <AA1> [rotamer_idx|auto]".to_string(),
+                        "usage: rotamers <CHAIN:RESSEQ> <AA1|AA3>".to_string(),
                     ));
                 }
                 let (c_s, r_s) = toks[0].split_once(':').ok_or_else(|| {
-                    ScriptError::Command("expected CHAIN:RESSEQ (e.g. B:105)".to_string())
+                    ScriptError::Command("expected CHAIN:RESSEQ (e.g. A:315)".to_string())
                 })?;
                 let ch = c_s
                     .chars()
@@ -2267,18 +2881,80 @@ impl BiomolSession {
                 let rseq: i32 = r_s.parse().map_err(|_| {
                     ScriptError::Command("invalid residue sequence number".to_string())
                 })?;
-                let aa = toks[1]
+                let aa = parse_aa_code(toks[1]).ok_or_else(|| {
+                    ScriptError::Command(format!("invalid target amino acid '{}'", toks[1]))
+                })?;
+                let mol = self
+                    .active_molecule()
+                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
+                let table = enumerate_rotamers_3d(mol, ch, rseq, aa)
+                    .map_err(|e| ScriptError::Command(e.to_string()))?;
+                let md = render_rotamers_markdown(&table);
+                let best = &table.candidates[table.best_rotamer_index];
+                let msg = format!(
+                    "Evaluated {} Dunbrack rotamers for {ch}:{}{rseq}{} ({}): best #{} (χ1={:.0}°, χ2={:?}, lig_clash={}, prot_clash={}).",
+                    table.candidates.len(),
+                    table.wild_type,
+                    table.mutant,
+                    table.backbone_bin.label(),
+                    best.rotamer_index + 1,
+                    best.chi1_deg,
+                    best.chi2_deg,
+                    best.clashes_ligand,
+                    best.clashes_protein
+                );
+                self.rotamer_table = Some(table);
+                self.last_module_markdown = md;
+                Ok(msg)
+            }
+            "mutate" | "swapaa" => {
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                if toks.len() < 2 {
+                    return Err(ScriptError::Command(
+                        "usage: mutate <CHAIN:RESSEQ> <AA1|AA3> [rotamer_idx|criteria N|auto]"
+                            .to_string(),
+                    ));
+                }
+                let (c_s, r_s) = toks[0].split_once(':').ok_or_else(|| {
+                    ScriptError::Command("expected CHAIN:RESSEQ (e.g. A:315)".to_string())
+                })?;
+                let ch = c_s
                     .chars()
                     .next()
-                    .ok_or_else(|| ScriptError::Command("missing mutant amino acid".to_string()))?;
+                    .ok_or_else(|| ScriptError::Command("missing chain id".to_string()))?;
+                let rseq: i32 = r_s.parse().map_err(|_| {
+                    ScriptError::Command("invalid residue sequence number".to_string())
+                })?;
+                let aa = parse_aa_code(toks[1]).ok_or_else(|| {
+                    ScriptError::Command(format!("invalid mutant amino acid '{}'", toks[1]))
+                })?;
+
+                // Enumerate all Dunbrack rotamers prior to mutation so GUI/Log displays full table
+                if let Some(mol_ro) = self.active_molecule()
+                    && let Ok(table) = enumerate_rotamers_3d(mol_ro, ch, rseq, aa)
+                {
+                    self.last_module_markdown = render_rotamers_markdown(&table);
+                    self.rotamer_table = Some(table);
+                }
+
+                // Support both 0-based `rotamer_idx` AND ChimeraX 1-based `criteria N`
+                let explicit_rot: Option<usize> = if toks.len() >= 4
+                    && toks[2].eq_ignore_ascii_case("criteria")
+                {
+                    toks[3].parse::<usize>().ok().map(|n| n.saturating_sub(1))
+                } else if let Some(&rot_s) = toks.get(2)
+                    && let Ok(idx) = rot_s.parse::<usize>()
+                {
+                    Some(idx)
+                } else {
+                    None
+                };
 
                 self.push_undo_snapshot();
                 let mol = self
                     .active_molecule_mut()
                     .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?;
-                let rep = if let Some(&rot_s) = toks.get(2)
-                    && let Ok(rot_idx) = rot_s.parse::<usize>()
-                {
+                let rep = if let Some(rot_idx) = explicit_rot {
                     mutate_residue_3d(mol, ch, rseq, aa, rot_idx)
                         .map_err(|e| ScriptError::Command(e.to_string()))?
                 } else {
@@ -2290,17 +2966,28 @@ impl BiomolSession {
                     .insert((ch, rseq), [0.18, 0.92, 0.55]);
                 self.render_opts
                     .sphere_overlays
+                    .retain(|s| s.category != "Clash");
+                self.render_opts
+                    .sphere_overlays
                     .extend(rep.clash_overlays.clone());
                 self.sync_active_render_opts();
                 self.dirty_geometry = true;
+                let chi2_s = rep
+                    .chi2_deg
+                    .map_or_else(|| "—".to_string(), |v| format!("{v:.0}°"));
                 let msg = format!(
-                    "Mutated {ch}:{}{rseq}{} (rotamer {}/{}, chi1={:.0}°): {} clashes, {} new H-bonds.",
+                    "Mutated {ch}:{}{rseq}{} (Dunbrack rot {}/{}, prob {:.1}%, {}, χ1={:.0}°, χ2={chi2_s}): {} clashes (lig={}, prot={}, max_ov={:.2} Å), {} new H-bonds.",
                     rep.wild_type,
                     rep.mutant,
                     rep.rotamer_index + 1,
                     rep.total_rotamers,
+                    rep.rotamer_probability_pct,
+                    rep.backbone_bin.label(),
                     rep.chi1_deg,
                     rep.clash_count,
+                    rep.clashes_ligand,
+                    rep.clashes_protein,
+                    rep.max_overlap_a,
                     rep.new_hbond_count
                 );
                 self.provenance.push(ProvenanceEntry {
@@ -2851,13 +3538,93 @@ impl BiomolSession {
                 self.dirty_geometry = true;
                 Ok(format!("B-Factor / Attribute Putty mode: {on}."))
             }
+            "~hbonds" => {
+                self.render_opts
+                    .line_overlays
+                    .retain(|l| !l.label.starts_with("HBond"));
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                Ok("Cleared H-bond overlays.".to_string())
+            }
+            "~clashes" => {
+                self.render_opts
+                    .line_overlays
+                    .retain(|l| !l.label.starts_with("Clash"));
+                self.render_opts
+                    .sphere_overlays
+                    .retain(|s| !s.category.eq_ignore_ascii_case("clash"));
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                Ok("Cleared steric clash overlays.".to_string())
+            }
+            "~contacts" => {
+                self.render_opts
+                    .line_overlays
+                    .retain(|l| !l.label.starts_with("Contact"));
+                self.sync_active_render_opts();
+                self.dirty_geometry = true;
+                Ok("Cleared contact overlays.".to_string())
+            }
             "hbonds" => {
-                let max_d: f64 = rest.parse().unwrap_or(3.5);
-                let mol = self
-                    .active_molecule()
-                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?
-                    .clone();
-                let hbs = detect_hbonds(&mol, None, None, max_d, 95.0);
+                if matches!(rest.to_ascii_lowercase().as_str(), "off" | "clear" | "none") {
+                    return self.execute_single_cmd("~hbonds");
+                }
+                let q = Self::parse_interaction_query(rest, 3.5);
+                let (mol_a, mask_a, mol_b_opt, mask_b) = self.resolve_interaction_targets(&q)?;
+                let mut hbs = Vec::new();
+                if let Some(mol_b) = mol_b_opt {
+                    if q.inter_model {
+                        hbs.extend(detect_hbonds_between(
+                            &mol_a,
+                            mask_a.as_deref(),
+                            &mol_b,
+                            mask_b.as_deref(),
+                            q.cutoff,
+                            95.0,
+                        ));
+                    }
+                    if q.intra_model && q.model_a == q.model_b {
+                        hbs.extend(detect_hbonds(
+                            &mol_a,
+                            mask_a.as_deref(),
+                            mask_b.as_deref(),
+                            q.cutoff,
+                            95.0,
+                        ));
+                    }
+                } else {
+                    if q.intra_model {
+                        hbs.extend(detect_hbonds(
+                            &mol_a,
+                            mask_a.as_deref(),
+                            mask_b.as_deref(),
+                            q.cutoff,
+                            95.0,
+                        ));
+                    }
+                    if q.inter_model {
+                        let active_id = self.active_model().map(|m| m.model_id);
+                        for other in &self.models {
+                            if Some(other.model_id) != active_id && other.visible {
+                                let ob = q.expr_b.as_deref().and_then(|e| {
+                                    evaluate_selection(&other.molecule, e, &self.named_selections)
+                                        .ok()
+                                });
+                                hbs.extend(detect_hbonds_between(
+                                    &mol_a,
+                                    mask_a.as_deref(),
+                                    &other.molecule,
+                                    ob.as_deref(),
+                                    q.cutoff,
+                                    95.0,
+                                ));
+                            }
+                        }
+                    }
+                }
+                self.render_opts
+                    .line_overlays
+                    .retain(|l| !l.label.starts_with("HBond"));
                 for h in hbs.iter().take(250) {
                     self.render_opts.line_overlays.push(LineOverlay {
                         label: format!(
@@ -2871,29 +3638,88 @@ impl BiomolSession {
                     });
                 }
                 let mut md = format!(
-                    "## Hydrogen Bonds (`hbonds`, cutoff {max_d:.1} Å)\n\nDetected **{}** geometric H-bonds.\n\n| Donor/Acceptor A | Donor/Acceptor B | Dist (Å) | Angle (°) | Est. E (kcal/mol) |\n|---|---|---:|---:|---:|\n",
+                    "## Hydrogen Bonds (`hbonds`, cutoff {:.1} Å, interModel={})\n\nDetected **{}** geometric H-bonds.\n\n| Donor/Acceptor A | Donor/Acceptor B | Dist (Å) | Angle (°) | Est. E (kcal/mol) |\n|---|---|---:|---:|---:|\n",
+                    q.cutoff,
+                    q.inter_model,
                     hbs.len()
                 );
-                for h in hbs.iter().take(30) {
+                for h in hbs.iter().take(40) {
                     md.push_str(&format!(
                         "| `{}` | `{}` | {:.2} | {:.1} | {:.2} |\n",
                         h.label_a, h.label_b, h.distance_a, h.angle_deg, h.energy_kcal
                     ));
                 }
                 self.last_module_markdown = md;
-                let msg = format!("Detected {} hydrogen bonds (<= {max_d:.1} Å).", hbs.len());
+                let msg = format!(
+                    "Detected {} hydrogen bonds (<= {:.1} Å, interModel={}).",
+                    hbs.len(),
+                    q.cutoff,
+                    q.inter_model
+                );
                 self.measurements_log.push(msg.clone());
                 self.sync_active_render_opts();
                 self.dirty_geometry = true;
                 Ok(msg)
             }
             "clashes" => {
-                let ov: f64 = rest.parse().unwrap_or(0.60);
-                let mol = self
-                    .active_molecule()
-                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?
-                    .clone();
-                let clashes = detect_clashes(&mol, None, None, ov);
+                if matches!(rest.to_ascii_lowercase().as_str(), "off" | "clear" | "none") {
+                    return self.execute_single_cmd("~clashes");
+                }
+                let q = Self::parse_interaction_query(rest, 0.60);
+                let (mol_a, mask_a, mol_b_opt, mask_b) = self.resolve_interaction_targets(&q)?;
+                let mut clashes = Vec::new();
+                if let Some(mol_b) = mol_b_opt {
+                    if q.inter_model {
+                        clashes.extend(detect_clashes_between(
+                            &mol_a,
+                            mask_a.as_deref(),
+                            &mol_b,
+                            mask_b.as_deref(),
+                            q.cutoff,
+                        ));
+                    }
+                    if q.intra_model && q.model_a == q.model_b {
+                        clashes.extend(detect_clashes(
+                            &mol_a,
+                            mask_a.as_deref(),
+                            mask_b.as_deref(),
+                            q.cutoff,
+                        ));
+                    }
+                } else {
+                    if q.intra_model {
+                        clashes.extend(detect_clashes(
+                            &mol_a,
+                            mask_a.as_deref(),
+                            mask_b.as_deref(),
+                            q.cutoff,
+                        ));
+                    }
+                    if q.inter_model {
+                        let active_id = self.active_model().map(|m| m.model_id);
+                        for other in &self.models {
+                            if Some(other.model_id) != active_id && other.visible {
+                                let ob = q.expr_b.as_deref().and_then(|e| {
+                                    evaluate_selection(&other.molecule, e, &self.named_selections)
+                                        .ok()
+                                });
+                                clashes.extend(detect_clashes_between(
+                                    &mol_a,
+                                    mask_a.as_deref(),
+                                    &other.molecule,
+                                    ob.as_deref(),
+                                    q.cutoff,
+                                ));
+                            }
+                        }
+                    }
+                }
+                self.render_opts
+                    .line_overlays
+                    .retain(|l| !l.label.starts_with("Clash"));
+                self.render_opts
+                    .sphere_overlays
+                    .retain(|s| !s.category.eq_ignore_ascii_case("clash"));
                 for c in clashes.iter().take(120) {
                     let mid = [
                         0.5 * (c.coords_a[0] + c.coords_b[0]),
@@ -2919,10 +3745,12 @@ impl BiomolSession {
                     });
                 }
                 let mut md = format!(
-                    "## Steric Clashes (`clashes`, VDW overlap >= {ov:.2} Å)\n\nDetected **{}** steric clashes.\n\n| Atom A | Atom B | Dist (Å) | VDW Overlap (Å) |\n|---|---|---:|---:|\n",
+                    "## Steric Clashes (`clashes`, VDW overlap >= {:.2} Å, interModel={})\n\nDetected **{}** steric clashes.\n\n| Atom A | Atom B | Dist (Å) | VDW Overlap (Å) |\n|---|---|---:|---:|\n",
+                    q.cutoff,
+                    q.inter_model,
                     clashes.len()
                 );
-                for c in clashes.iter().take(30) {
+                for c in clashes.iter().take(40) {
                     md.push_str(&format!(
                         "| `{}` | `{}` | {:.2} | {:.2} |\n",
                         c.label_a, c.label_b, c.distance_a, c.overlap_a
@@ -2930,8 +3758,10 @@ impl BiomolSession {
                 }
                 self.last_module_markdown = md;
                 let msg = format!(
-                    "Detected {} steric clashes (overlap >= {ov:.2} Å).",
-                    clashes.len()
+                    "Detected {} steric clashes (overlap >= {:.2} Å, interModel={}).",
+                    clashes.len(),
+                    q.cutoff,
+                    q.inter_model
                 );
                 self.measurements_log.push(msg.clone());
                 self.sync_active_render_opts();
@@ -2939,12 +3769,65 @@ impl BiomolSession {
                 Ok(msg)
             }
             "contacts" => {
-                let cut: f64 = rest.parse().unwrap_or(4.0);
-                let mol = self
-                    .active_molecule()
-                    .ok_or_else(|| ScriptError::Command("no biomolecule loaded".to_string()))?
-                    .clone();
-                let contacts = detect_contacts(&mol, None, None, cut, 200);
+                if matches!(rest.to_ascii_lowercase().as_str(), "off" | "clear" | "none") {
+                    return self.execute_single_cmd("~contacts");
+                }
+                let q = Self::parse_interaction_query(rest, 4.0);
+                let (mol_a, mask_a, mol_b_opt, mask_b) = self.resolve_interaction_targets(&q)?;
+                let mut contacts = Vec::new();
+                if let Some(mol_b) = mol_b_opt {
+                    if q.inter_model {
+                        contacts.extend(detect_contacts_between(
+                            &mol_a,
+                            mask_a.as_deref(),
+                            &mol_b,
+                            mask_b.as_deref(),
+                            q.cutoff,
+                            250,
+                        ));
+                    }
+                    if q.intra_model && q.model_a == q.model_b {
+                        contacts.extend(detect_contacts(
+                            &mol_a,
+                            mask_a.as_deref(),
+                            mask_b.as_deref(),
+                            q.cutoff,
+                            250,
+                        ));
+                    }
+                } else {
+                    if q.intra_model {
+                        contacts.extend(detect_contacts(
+                            &mol_a,
+                            mask_a.as_deref(),
+                            mask_b.as_deref(),
+                            q.cutoff,
+                            250,
+                        ));
+                    }
+                    if q.inter_model {
+                        let active_id = self.active_model().map(|m| m.model_id);
+                        for other in &self.models {
+                            if Some(other.model_id) != active_id && other.visible {
+                                let ob = q.expr_b.as_deref().and_then(|e| {
+                                    evaluate_selection(&other.molecule, e, &self.named_selections)
+                                        .ok()
+                                });
+                                contacts.extend(detect_contacts_between(
+                                    &mol_a,
+                                    mask_a.as_deref(),
+                                    &other.molecule,
+                                    ob.as_deref(),
+                                    q.cutoff,
+                                    250,
+                                ));
+                            }
+                        }
+                    }
+                }
+                self.render_opts
+                    .line_overlays
+                    .retain(|l| !l.label.starts_with("Contact"));
                 for c in contacts.iter().take(150) {
                     self.render_opts.line_overlays.push(LineOverlay {
                         label: format!(
@@ -2958,17 +3841,24 @@ impl BiomolSession {
                     });
                 }
                 let mut md = format!(
-                    "## Atomic Contacts (`contacts`, cutoff {cut:.1} Å)\n\nDetected **{}** inter-chain contacts.\n\n| Atom A | Atom B | Dist (Å) |\n|---|---|---:|\n",
+                    "## Atomic Contacts (`contacts`, cutoff {:.1} Å, interModel={})\n\nDetected **{}** non-covalent contacts.\n\n| Atom A | Atom B | Dist (Å) |\n|---|---|---:|\n",
+                    q.cutoff,
+                    q.inter_model,
                     contacts.len()
                 );
-                for c in contacts.iter().take(30) {
+                for c in contacts.iter().take(40) {
                     md.push_str(&format!(
                         "| `{}` | `{}` | {:.2} |\n",
                         c.label_a, c.label_b, c.distance_a
                     ));
                 }
                 self.last_module_markdown = md;
-                let msg = format!("Detected {} contacts (<= {cut:.1} Å).", contacts.len());
+                let msg = format!(
+                    "Detected {} contacts (<= {:.1} Å, interModel={}).",
+                    contacts.len(),
+                    q.cutoff,
+                    q.inter_model
+                );
                 self.measurements_log.push(msg.clone());
                 self.sync_active_render_opts();
                 self.dirty_geometry = true;
@@ -3011,7 +3901,8 @@ impl BiomolSession {
                 self.add_dihedral_measurement(ia, ib, ic, id)
             }
             "measure" => {
-                if rest.eq_ignore_ascii_case("clear") {
+                let low = rest.to_ascii_lowercase();
+                if low == "clear" {
                     self.measurements_log.clear();
                     self.axes.clear();
                     self.planes.clear();
@@ -3021,6 +3912,11 @@ impl BiomolSession {
                     self.sync_active_render_opts();
                     self.dirty_geometry = true;
                     return Ok("Cleared all measurements, axes, planes, and 3D labels.".to_string());
+                }
+                if let Some(tail) = low.strip_prefix("sasa") {
+                    let orig_tail = rest[4..].trim();
+                    let _ = tail;
+                    return self.run_sasa_query(orig_tail);
                 }
                 Ok(if self.measurements_log.is_empty() {
                     "No measurements recorded yet.".to_string()
@@ -4309,6 +5205,124 @@ $$$$
         let sc = restored.build_viewport_scene();
         assert!((sc.shadow_strength - 0.78).abs() < 1e-4);
         assert!(!sc.transparent_meshes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn wave9_prac1_to_prac3_ramachandran_and_aggregation_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Synthetic kinase-like pocket + imatinib-like ligand (STI) + missing residue gap + truncated Lys
+        let mut pdb = String::new();
+        let pep = build_de_novo_peptide_3d("AAFIVLTWKAA", "helix", 'A')?;
+        // Shift numbering to 310..320 so Thr is at 316, place a ligand atom 2.85 A from Thr316 OG1
+        let mut og1_pos = [0.0_f64; 3];
+        let mut serial = 1usize;
+        for a in &pep.atoms {
+            let rseq = a.res_seq + 309;
+            // Deliberately drop Lys318 NZ to simulate truncated crystal sidechain (PRAC1 Part 5B)
+            if rseq == 318 && a.name == "NZ" {
+                continue;
+            }
+            if rseq == 316 && a.name == "OG1" {
+                og1_pos = a.coords;
+            }
+            let bf = if rseq == 318 { 74.0 } else { 18.0 };
+            pdb.push_str(&format!(
+                "ATOM  {:5} {:^4} {:>3} {}{:4}    {:8.3}{:8.3}{:8.3}  1.00{:6.2}          {:>2}\n",
+                serial,
+                a.name,
+                a.res_name,
+                a.chain,
+                rseq,
+                a.coords[0],
+                a.coords[1],
+                a.coords[2],
+                bf,
+                a.element
+            ));
+            serial += 1;
+        }
+        // Add a ligand STI making an H-bond at 2.85 A to Thr316 OG1
+        pdb.push_str(&format!(
+            "HETATM{:5}  N13 STI A 601    {:8.3}{:8.3}{:8.3}  1.00 24.00           N\n",
+            serial,
+            og1_pos[0] + 2.85,
+            og1_pos[1],
+            og1_pos[2]
+        ));
+        serial += 1;
+        pdb.push_str(&format!(
+            "HETATM{:5}  C14 STI A 601    {:8.3}{:8.3}{:8.3}  1.00 24.00           C\n",
+            serial,
+            og1_pos[0] + 4.15,
+            og1_pos[1] + 0.4,
+            og1_pos[2]
+        ));
+        pdb.push_str("END\n");
+
+        let mut sess = BiomolSession::default();
+        sess.load_structure_text("abl_prac", &pdb, None)?;
+
+        // PRAC1: info, rainbow, bfactor, transparency, select b>=50
+        let inf = sess.execute_dsl("info missing")?;
+        assert!(inf.contains("1 truncated sidechain"));
+        let rb = sess.execute_dsl("rainbow")?;
+        assert!(rb.contains("Rainbow"));
+        let bf = sess.execute_dsl("color bfactor; key bfactor")?;
+        assert!(bf.contains("B-Factor"));
+        let tr = sess.execute_dsl("surface on; transparency 60")?;
+        assert!(tr.contains("60%"));
+        assert!((sess.render_opts.surface_alpha - 0.40).abs() < 0.02);
+        let sel_b = sess.execute_dsl("select mobile, b>=50")?;
+        assert!(sel_b.contains("matched"));
+
+        // PRAC2: pocket sticks, ligand hbonds, SASA burial %
+        let st = sess.execute_dsl("sticks byres (within 4.5 of ligand) and protein")?;
+        assert!(st.contains("Displayed sticks"));
+        let sasa_msg = sess.execute_dsl("measure sasa ligand")?;
+        assert!(sasa_msg.contains("% buried"));
+        let hb_wt = sess.execute_dsl("hbonds ligand")?;
+        assert!(hb_wt.contains("hydrogen bonds"));
+        let _ = sess.execute_dsl("~hbonds")?;
+
+        // PRAC3: clone wildtype #2, hide #2, enumerate Dunbrack rotamers, swapaa T->ILE, interModel check!
+        let cl = sess.execute_dsl("clone wildtype; hide #2")?;
+        assert!(cl.contains("Cloned #1 into #2 'wildtype'"));
+        assert_eq!(sess.models.len(), 2);
+
+        let rot_msg = sess.execute_dsl("rotamers A:316 ile")?;
+        assert!(rot_msg.contains("7 Dunbrack rotamers"));
+        assert!(sess.rotamer_table.is_some());
+
+        let mut_msg = sess.execute_dsl("swapaa A:316 ile criteria 1")?;
+        assert!(mut_msg.contains("Mutated A:T316I"));
+        assert!(mut_msg.contains("χ2="));
+
+        // Cross-model clash/contact check (#1 mutant vs #2 wildtype)
+        let inter = sess.execute_dsl("contacts #1 resi 316 restrict #2 ligand intermodel true intramodel false")?;
+        assert!(inter.contains("interModel=true"));
+
+        // TRAB1: Ramachandran audit
+        let rama_msg = sess.execute_dsl("ramachandran")?;
+        assert!(rama_msg.contains("Ramachandran"));
+        assert!(sess.ramachandran.is_some());
+
+        // TRAB4 Tool 2: General 3D surface aggregation + solubility rescue simulation
+        let agg_msg = sess.execute_dsl("aggregation")?;
+        assert!(agg_msg.contains("3D Aggregation"));
+        assert!(sess.aggregation.is_some());
+        assert!(!sess.render_opts.residue_colors.is_empty());
+
+        let rescue_msg = sess.execute_dsl("aggregation rescue A:313 D")?;
+        assert!(rescue_msg.contains("Solubility rescue"));
+
+        // Verify .biomol.zip roundtrips residue_colors cleanly
+        let (zb, _) = encode_session_zip_bytes(&sess)?;
+        let (restored, _) = decode_session_zip_bytes(&zb)?;
+        assert_eq!(
+            restored.render_opts.residue_colors.len(),
+            sess.render_opts.residue_colors.len()
+        );
         Ok(())
     }
 }

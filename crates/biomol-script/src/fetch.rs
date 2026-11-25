@@ -14,6 +14,8 @@ pub struct FetchedAsset {
     pub local_path: PathBuf,
     pub cached_hit: bool,
     pub is_volume_map: bool,
+    /// Optional companion AlphaFoldDB PAE JSON downloaded alongside `af:<UNIPROT>`.
+    pub pae_path: Option<PathBuf>,
 }
 
 fn cache_root() -> PathBuf {
@@ -113,6 +115,7 @@ pub fn fetch_structure_spec(spec: &str) -> Result<FetchedAsset, String> {
                     local_path: cif_path,
                     cached_hit: true,
                     is_volume_map: false,
+                    pae_path: None,
                 });
             }
             let pdb_path = root.join("rcsb").join(format!("{id}.pdb"));
@@ -123,6 +126,7 @@ pub fn fetch_structure_spec(spec: &str) -> Result<FetchedAsset, String> {
                     local_path: pdb_path,
                     cached_hit: true,
                     is_volume_map: false,
+                    pae_path: None,
                 });
             }
             let cif_url = format!("https://files.rcsb.org/download/{id}.cif");
@@ -133,6 +137,7 @@ pub fn fetch_structure_spec(spec: &str) -> Result<FetchedAsset, String> {
                     local_path: cif_path,
                     cached_hit: false,
                     is_volume_map: false,
+                    pae_path: None,
                 });
             }
             let pdb_url = format!("https://files.rcsb.org/download/{id}.pdb");
@@ -143,30 +148,32 @@ pub fn fetch_structure_spec(spec: &str) -> Result<FetchedAsset, String> {
                 local_path: pdb_path,
                 cached_hit: false,
                 is_volume_map: false,
+                pae_path: None,
             })
         }
         "af" | "alphafold" => {
             let id = validate_id(raw_id, 20)?.to_ascii_uppercase();
-            let dest = root
-                .join("alphafold")
-                .join(format!("AF-{id}-F1-model_v4.pdb"));
-            if dest.is_file() {
-                return Ok(FetchedAsset {
-                    provider: "AlphaFoldDB".to_string(),
-                    canonical_id: id,
-                    local_path: dest,
-                    cached_hit: true,
-                    is_volume_map: false,
-                });
+            let af_dir = root.join("alphafold");
+            let dest = af_dir.join(format!("AF-{id}-F1-model_v4.pdb"));
+            let pae_dest = af_dir.join(format!("AF-{id}-F1-predicted_aligned_error_v4.json"));
+            let pae_url = format!(
+                "https://alphafold.ebi.ac.uk/files/AF-{id}-F1-predicted_aligned_error_v4.json"
+            );
+            let cached_hit = dest.is_file();
+            if !cached_hit {
+                let url = format!("https://alphafold.ebi.ac.uk/files/AF-{id}-F1-model_v4.pdb");
+                curl_download(&url, &dest)?;
             }
-            let url = format!("https://alphafold.ebi.ac.uk/files/AF-{id}-F1-model_v4.pdb");
-            curl_download(&url, &dest)?;
+            if !pae_dest.is_file() {
+                let _ = curl_download(&pae_url, &pae_dest);
+            }
             Ok(FetchedAsset {
                 provider: "AlphaFoldDB".to_string(),
                 canonical_id: id,
                 local_path: dest,
-                cached_hit: false,
+                cached_hit,
                 is_volume_map: false,
+                pae_path: pae_dest.is_file().then_some(pae_dest),
             })
         }
         "pubchem" | "cid" => {
@@ -182,6 +189,7 @@ pub fn fetch_structure_spec(spec: &str) -> Result<FetchedAsset, String> {
                     local_path: dest,
                     cached_hit: true,
                     is_volume_map: false,
+                    pae_path: None,
                 });
             }
             let url = format!(
@@ -194,6 +202,7 @@ pub fn fetch_structure_spec(spec: &str) -> Result<FetchedAsset, String> {
                 local_path: dest,
                 cached_hit: false,
                 is_volume_map: false,
+                pae_path: None,
             })
         }
         "emdb" | "emd" => {
@@ -210,6 +219,7 @@ pub fn fetch_structure_spec(spec: &str) -> Result<FetchedAsset, String> {
                     local_path: dest,
                     cached_hit: true,
                     is_volume_map: true,
+                    pae_path: None,
                 });
             }
             let gz_dest = root.join("emdb").join(format!("emd_{digits}.map.gz"));
@@ -235,6 +245,7 @@ pub fn fetch_structure_spec(spec: &str) -> Result<FetchedAsset, String> {
                 local_path: dest,
                 cached_hit: false,
                 is_volume_map: true,
+                pae_path: None,
             })
         }
         other => Err(format!(

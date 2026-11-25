@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use biomol_model::tug_atom_with_sculpting;
+use biomol_model::{
+    RamaRegion, RamaResidueKind, classify_ramachandran, tug_atom_with_sculpting,
+};
 use biomol_modules::{
     ModuleId, discover_installed_plugins, run_adc_module, run_antibody_module, run_enzyme_module,
     run_ncrna_module, run_pk_tmdd_module,
@@ -68,6 +70,7 @@ enum PickMode {
 enum RightModuleTab {
     ViewDockX,
     Measure,
+    RamaAgg,
     MsaPae,
     MovieMorph,
     SymGlycans,
@@ -189,6 +192,13 @@ pub struct BiomolCraftApp {
     sculpt_drag_atom: Option<usize>,
     sculpt_last_feedback: String,
     xtc_path_input: String,
+
+    // Wave 9 (v1.2.0): Interactive Ramachandran Plot & 3D Aggregation / Solubility Rescue state
+    rama_contour_kind: RamaResidueKind,
+    agg_dynamic_mode: bool,
+    agg_rescue_chain: String,
+    agg_rescue_res: i32,
+    agg_rescue_aa: char,
 }
 
 impl Default for BiomolCraftApp {
@@ -217,7 +227,7 @@ impl BiomolCraftApp {
             fetch_id_input: "1CRN".to_string(),
             console_input: String::new(),
             console_log: vec![
-                "BiomolCraft v1.1.0 — PCF Soft Shadows · GROMACS .xtc · 3D Binding Pockets · Mouse Drag-to-Sculpt (Shift+Drag) · .biomol.zip · ViewDockX. Type 'help'.".to_string(),
+                "BiomolCraft v1.2.0 — Interactive Ramachandran · 3D Aggregation & Rescue · Dunbrack χ1-χ4 Rotamers · SASA Burial · Rainbow/B-Factor · Auto-PAE · ViewDockX. Type 'help'.".to_string(),
                 link_status.to_string(),
             ],
             picked_atom_info: "Click any atom/residue in 3D or sequence strip to inspect".to_string(),
@@ -274,6 +284,11 @@ impl BiomolCraftApp {
             sculpt_drag_atom: None,
             sculpt_last_feedback: "Hold Shift + Left-Drag any atom (or select Sculpt Drag mode) to tug with live MM relaxation.".to_string(),
             xtc_path_input: String::new(),
+            rama_contour_kind: RamaResidueKind::General,
+            agg_dynamic_mode: false,
+            agg_rescue_chain: "A".to_string(),
+            agg_rescue_res: 10,
+            agg_rescue_aa: 'D',
         };
 
         if let Some(bundle_path) = startup.dock_bundle {
@@ -1169,8 +1184,10 @@ impl eframe::App for BiomolCraftApp {
                     for c in [
                         ColorScheme::Chain,
                         ColorScheme::SecondaryStructure,
+                        ColorScheme::Rainbow,
                         ColorScheme::Nucleotide,
                         ColorScheme::ElementCpk,
+                        ColorScheme::CrystallographicBfactor,
                         ColorScheme::BfactorPlddt,
                         ColorScheme::Sap3D,
                         ColorScheme::ElectrostaticEsp,
@@ -1184,6 +1201,7 @@ impl eframe::App for BiomolCraftApp {
                             )
                             .clicked()
                         {
+                            self.session.render_opts.residue_colors.clear();
                             self.session.dirty_geometry = true;
                             self.sync_viewport_scene();
                         }
@@ -1367,6 +1385,7 @@ impl eframe::App for BiomolCraftApp {
                     for (t, lbl) in [
                         (RightModuleTab::ViewDockX, "ViewDockX"),
                         (RightModuleTab::Measure, "Measure"),
+                        (RightModuleTab::RamaAgg, "Rama / Agg"),
                         (RightModuleTab::MsaPae, "MSA / PAE"),
                         (RightModuleTab::MovieMorph, "Movie / Morph"),
                         (RightModuleTab::SymGlycans, "Sym / SNFG"),
@@ -1388,6 +1407,7 @@ impl eframe::App for BiomolCraftApp {
                 egui::ScrollArea::vertical().show(ui, |ui| match self.right_tab {
                     RightModuleTab::ViewDockX => self.ui_viewdockx_module(ui),
                     RightModuleTab::Measure => self.ui_measure_module(ui),
+                    RightModuleTab::RamaAgg => self.ui_rama_agg_module(ui),
                     RightModuleTab::MsaPae => self.ui_msa_pae_module(ui),
                     RightModuleTab::MovieMorph => self.ui_movie_morph_module(ui),
                     RightModuleTab::SymGlycans => self.ui_sym_glycans_module(ui),
@@ -1818,9 +1838,9 @@ impl BiomolCraftApp {
                     }
                 });
             ui.label("Rotamer:");
-            ui.add(egui::DragValue::new(&mut self.mut_rotamer).range(0..=2));
+            ui.add(egui::DragValue::new(&mut self.mut_rotamer).range(0..=6));
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Apply Mutation (Auto Repack)").clicked() {
                 let cmd = format!(
                     "mutate {}:{} {}",
@@ -1835,7 +1855,55 @@ impl BiomolCraftApp {
                 );
                 self.run_dsl(&cmd);
             }
+            if ui.button("List Dunbrack Rotamers (χ1/χ2)").clicked() {
+                let cmd = format!(
+                    "rotamers {}:{} {}",
+                    self.mut_chain, self.mut_res_seq, self.mut_target_aa
+                );
+                self.run_dsl(&cmd);
+            }
+            if ui.button("Clone WT Copy").clicked() {
+                self.run_dsl("clone wildtype");
+            }
         });
+        let mut click_rotamer: Option<(char, i32, char, usize)> = None;
+        if let Some(ref rt) = self.session.rotamer_table {
+            ui.separator();
+            ui.strong(format!(
+                "Dunbrack Rotamers {}{}{} ({}, {} rot — click to apply):",
+                rt.wild_type,
+                rt.res_seq,
+                rt.mutant,
+                rt.backbone_bin.label(),
+                rt.candidates.len()
+            ));
+            for c in &rt.candidates {
+                let c2 = c
+                    .chi2_deg
+                    .map_or_else(|| "—".to_string(), |v| format!("{v:.0}°"));
+                let star = if c.rotamer_index == rt.best_rotamer_index {
+                    "★ "
+                } else {
+                    ""
+                };
+                let lbl = format!(
+                    "{star}#{} ({:.0}%) χ1={:.0}° χ2={c2} | Lig:{} Prot:{} (ov {:.2}Å)",
+                    c.rotamer_index + 1,
+                    c.probability_pct,
+                    c.chi1_deg,
+                    c.clashes_ligand,
+                    c.clashes_protein,
+                    c.max_overlap_a
+                );
+                if ui.small_button(lbl).clicked() {
+                    click_rotamer = Some((rt.chain, rt.res_seq, rt.mutant, c.rotamer_index));
+                }
+            }
+        }
+        if let Some((ch, rseq, aa, idx)) = click_rotamer {
+            self.mut_rotamer = idx;
+            self.run_dsl(&format!("mutate {ch}:{rseq} {aa} {idx}"));
+        }
         ui.horizontal(|ui| {
             if ui.button("Minimize Local MM (80 steps)").clicked() {
                 self.run_dsl("minimize 80");
@@ -2554,6 +2622,15 @@ impl BiomolCraftApp {
             if ui.button("Contacts (4.0 Å)").clicked() {
                 self.run_dsl("contacts 4.0");
             }
+            if ui.button("SASA Burial (%)").clicked() {
+                self.run_dsl("sasa");
+            }
+            if ui.button("Pocket Sticks (<4 Å)").clicked() {
+                self.run_dsl("sticks byres (within 4.0 of ligand) and protein");
+            }
+            if ui.button("Info: Missing/Gaps").clicked() {
+                self.run_dsl("info missing");
+            }
             if ui.button("Define Axis (PCA)").clicked() {
                 self.run_dsl("axis");
             }
@@ -2575,6 +2652,12 @@ impl BiomolCraftApp {
             if ui.small_button("Key: Auto").clicked() {
                 self.run_dsl("key auto");
             }
+            if ui.small_button("Key: B-Factor").clicked() {
+                self.run_dsl("key bfactor");
+            }
+            if ui.small_button("Key: Rainbow").clicked() {
+                self.run_dsl("key rainbow");
+            }
             if ui.small_button("Key: ESP").clicked() {
                 self.run_dsl("key esp");
             }
@@ -2583,6 +2666,9 @@ impl BiomolCraftApp {
             }
             if ui.small_button("Key: pLDDT").clicked() {
                 self.run_dsl("key plddt");
+            }
+            if ui.small_button("Key: Agg").clicked() {
+                self.run_dsl("key agg");
             }
             if ui.small_button("Key: Off").clicked() {
                 self.run_dsl("key off");
@@ -2623,6 +2709,260 @@ impl BiomolCraftApp {
         ));
         for line in self.session.measurements_log.iter().rev().take(15) {
             ui.monospace(line);
+        }
+        if !self.session.last_module_markdown.is_empty() {
+            ui.separator();
+            ui.monospace(&self.session.last_module_markdown);
+        }
+    }
+
+    fn ui_rama_agg_module(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Ramachandran (φ/ψ) · 3D Surface Aggregation");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Compute Ramachandran").clicked() {
+                self.run_dsl("ramachandran");
+            }
+            if ui.button("Highlight Outliers in 3D").clicked() {
+                self.run_dsl("ramachandran outliers");
+            }
+            if ui.small_button("Info: Gaps/Missing").clicked() {
+                self.run_dsl("info missing");
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Basin Contour:");
+            for kind in [
+                RamaResidueKind::General,
+                RamaResidueKind::Glycine,
+                RamaResidueKind::Proline,
+                RamaResidueKind::PreProline,
+            ] {
+                ui.selectable_value(&mut self.rama_contour_kind, kind, kind.label());
+            }
+        });
+
+        // Interactive 2D [-180..+180] x [-180..+180] Ramachandran Plot synced with 3D!
+        let mut clicked_res: Option<(char, i32)> = None;
+        let side = 252.0_f32;
+        let (resp, painter) = ui.allocate_painter(egui::vec2(side, side), egui::Sense::click());
+        let rect = resp.rect;
+        let grid_n = 36usize;
+        let cell = side / (grid_n as f32);
+        for gy in 0..grid_n {
+            // Top = +180 deg, Bottom = -180 deg
+            let psi = 180.0 - ((gy as f64 + 0.5) / grid_n as f64) * 360.0;
+            for gx in 0..grid_n {
+                let phi = -180.0 + ((gx as f64 + 0.5) / grid_n as f64) * 360.0;
+                let (reg, _) = classify_ramachandran(self.rama_contour_kind, phi, psi);
+                let col = match reg {
+                    RamaRegion::Favored => egui::Color32::from_rgb(20, 92, 96),
+                    RamaRegion::Allowed => egui::Color32::from_rgb(24, 54, 84),
+                    RamaRegion::Outlier => egui::Color32::from_rgb(18, 22, 32),
+                };
+                let cr = egui::Rect::from_min_size(
+                    egui::pos2(
+                        rect.left() + gx as f32 * cell,
+                        rect.top() + gy as f32 * cell,
+                    ),
+                    egui::vec2(cell + 0.5, cell + 0.5),
+                );
+                painter.rect_filled(cr, 0.0, col);
+            }
+        }
+        // Zero-axes crosshairs and border
+        let axis_stroke = egui::Stroke::new(
+            1.0_f32,
+            egui::Color32::from_rgba_unmultiplied(180, 196, 220, 110),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(rect.center().x, rect.top()),
+                egui::pos2(rect.center().x, rect.bottom()),
+            ],
+            axis_stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(rect.left(), rect.center().y),
+                egui::pos2(rect.right(), rect.center().y),
+            ],
+            axis_stroke,
+        );
+        painter.rect_stroke(
+            rect,
+            2.0_f32,
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(100, 116, 139)),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            egui::pos2(rect.left() + 4.0, rect.top() + 3.0),
+            egui::Align2::LEFT_TOP,
+            "ψ +180°",
+            egui::FontId::monospace(9.5),
+            egui::Color32::LIGHT_GRAY,
+        );
+        painter.text(
+            egui::pos2(rect.right() - 4.0, rect.bottom() - 3.0),
+            egui::Align2::RIGHT_BOTTOM,
+            "φ +180°",
+            egui::FontId::monospace(9.5),
+            egui::Color32::LIGHT_GRAY,
+        );
+
+        let mut hover_tip: Option<String> = None;
+        let pointer_pos = resp.hover_pos();
+        if let Some(ref rama) = self.session.ramachandran {
+            let mut nearest_click: Option<(f32, char, i32)> = None;
+            let click_pos = if resp.clicked() {
+                resp.interact_pointer_pos()
+            } else {
+                None
+            };
+            for p in &rama.points {
+                let px = rect.left() + (((p.phi_deg + 180.0) / 360.0) as f32).clamp(0.0, 1.0) * side;
+                let py = rect.top() + (((180.0 - p.psi_deg) / 360.0) as f32).clamp(0.0, 1.0) * side;
+                let center = egui::pos2(px, py);
+                let col = match p.region {
+                    RamaRegion::Favored => egui::Color32::from_rgb(74, 222, 128),
+                    RamaRegion::Allowed => egui::Color32::from_rgb(250, 204, 21),
+                    RamaRegion::Outlier => egui::Color32::from_rgb(244, 63, 94),
+                };
+                let r = if p.region == RamaRegion::Outlier { 4.2 } else { 2.8 };
+                if p.kind == RamaResidueKind::Proline {
+                    painter.rect_filled(
+                        egui::Rect::from_center_size(center, egui::vec2(r * 2.0, r * 2.0)),
+                        0.0,
+                        col,
+                    );
+                } else {
+                    painter.circle_filled(center, r, col);
+                }
+                if let Some(hp) = pointer_pos
+                    && hp.distance(center) < 7.0
+                {
+                    hover_tip = Some(format!(
+                        "{}:{}{} ({}) | φ={:.1}° ψ={:.1}° | {}",
+                        p.chain,
+                        p.res_name,
+                        p.res_seq,
+                        p.kind.label(),
+                        p.phi_deg,
+                        p.psi_deg,
+                        p.region.label()
+                    ));
+                }
+                if let Some(cp) = click_pos {
+                    let d = cp.distance(center);
+                    if d < 12.0 && nearest_click.is_none_or(|(bd, _, _)| d < bd) {
+                        nearest_click = Some((d, p.chain, p.res_seq));
+                    }
+                }
+            }
+            if let Some((_, ch, rs)) = nearest_click {
+                clicked_res = Some((ch, rs));
+            }
+            ui.small(format!(
+                "Evaluated {} res: {:.1}% Favored ({}) · {:.1}% Allowed ({}) · {:.1}% Outliers ({}) · {} cis",
+                rama.points.len(),
+                rama.favored_pct,
+                rama.favored_count,
+                rama.allowed_pct,
+                rama.allowed_count,
+                rama.outlier_pct,
+                rama.outlier_count,
+                rama.cis_peptide_count
+            ));
+            if let Some(tip) = hover_tip {
+                ui.colored_label(egui::Color32::from_rgb(125, 211, 252), tip);
+            } else {
+                ui.small("Click any dot to select & focus that residue in the 3D viewport.");
+            }
+        } else {
+            ui.small("Click 'Compute Ramachandran' to plot φ/ψ dihedrals for the active model.");
+        }
+
+        ui.separator();
+        ui.strong("3D Surface Aggregation & Solubility Rescue (Aggrescan3D-style)");
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.agg_dynamic_mode, "Dynamic (B-factor)");
+            if ui.button("Run 3D Aggregation Scan").clicked() {
+                let cmd = if self.agg_dynamic_mode {
+                    "aggregation dynamic"
+                } else {
+                    "aggregation static"
+                };
+                self.run_dsl(cmd);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Rescue:");
+            ui.add(egui::TextEdit::singleline(&mut self.agg_rescue_chain).desired_width(28.0));
+            ui.add(egui::DragValue::new(&mut self.agg_rescue_res));
+            ui.label("→");
+            egui::ComboBox::from_id_salt("agg_rescue_aa_cb")
+                .selected_text(self.agg_rescue_aa.to_string())
+                .width(46.0)
+                .show_ui(ui, |ui| {
+                    for aa in ['D', 'E', 'K', 'R', 'S', 'Q', 'N', 'A'] {
+                        ui.selectable_value(&mut self.agg_rescue_aa, aa, aa.to_string());
+                    }
+                });
+            if ui.small_button("Simulate").clicked() {
+                let dyn_flag = if self.agg_dynamic_mode { " dynamic" } else { "" };
+                let cmd = format!(
+                    "aggregation rescue {}:{} {}{dyn_flag}",
+                    self.agg_rescue_chain, self.agg_rescue_res, self.agg_rescue_aa
+                );
+                self.run_dsl(&cmd);
+            }
+        });
+
+        let mut pick_agg_res: Option<(char, i32)> = None;
+        if let Some(ref agg) = self.session.aggregation {
+            ui.small(format!(
+                "Avg: {:+.3} · Max: {:+.3} · Total+: {:.2} · Hotspots (>0.50): {} · Patches: {}",
+                agg.avg_score,
+                agg.max_score,
+                agg.total_positive_score,
+                agg.hotspot_count,
+                agg.patches.len()
+            ));
+            let mut top: Vec<_> = agg
+                .residue_scores
+                .iter()
+                .filter(|r| r.score_3d > 0.35)
+                .collect();
+            top.sort_by(|a, b| b.score_3d.total_cmp(&a.score_3d));
+            if !top.is_empty() {
+                ui.small("Top exposed hotspots (click to focus & load into Rescue):");
+                ui.horizontal_wrapped(|ui| {
+                    for r in top.iter().take(10) {
+                        if ui
+                            .small_button(format!(
+                                "{}:{}{} ({:+.2})",
+                                r.chain, r.res_name, r.res_seq, r.score_3d
+                            ))
+                            .clicked()
+                        {
+                            pick_agg_res = Some((r.chain, r.res_seq));
+                        }
+                    }
+                });
+            }
+        }
+
+        if let Some((ch, rs)) = pick_agg_res {
+            self.agg_rescue_chain = ch.to_string();
+            self.agg_rescue_res = rs;
+            clicked_res = Some((ch, rs));
+        }
+        if let Some((ch, rs)) = clicked_res {
+            self.mut_chain = ch.to_string();
+            self.mut_res_seq = rs;
+            let msg = self.session.focus_residue_3d(ch, rs);
+            self.console_log.push(msg.clone());
+            self.status_line = msg;
+            self.sync_viewport_scene();
         }
         if !self.session.last_module_markdown.is_empty() {
             ui.separator();
@@ -2906,7 +3246,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1520.0, 920.0])
             .with_title(
-                "BiomolCraft v1.0.0 — CraftBio Biomolecular 3D Studio, Command Palette, .biomol.zip & ViewDockX",
+                "BiomolCraft v1.2.0 — CraftBio Biomolecular 3D Studio · Ramachandran · 3D Aggregation · Dunbrack Rotamers · ViewDockX",
             ),
         ..Default::default()
     };

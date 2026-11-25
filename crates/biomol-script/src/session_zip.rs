@@ -67,6 +67,8 @@ struct ArchivedRenderOpts {
     #[serde(default)]
     residue_highlights: Vec<(char, i32, [f32; 3])>,
     #[serde(default)]
+    residue_colors: Vec<(char, i32, [f32; 3])>,
+    #[serde(default)]
     sphere_overlays: Vec<SphereOverlay>,
     #[serde(default)]
     line_overlays: Vec<LineOverlay>,
@@ -85,6 +87,12 @@ impl From<&RenderOptions> for ArchivedRenderOpts {
             .map(|(&(c, r), &rgb)| (c, r, rgb))
             .collect();
         rh.sort_by_key(|&(c, r, _)| (c, r));
+        let mut rc: Vec<(char, i32, [f32; 3])> = o
+            .residue_colors
+            .iter()
+            .map(|(&(c, r), &rgb)| (c, r, rgb))
+            .collect();
+        rc.sort_by_key(|&(c, r, _)| (c, r));
         Self {
             representation: o.representation,
             color_scheme: o.color_scheme,
@@ -100,6 +108,7 @@ impl From<&RenderOptions> for ArchivedRenderOpts {
             shadow_strength: o.shadow_strength,
             background: o.background,
             residue_highlights: rh,
+            residue_colors: rc,
             sphere_overlays: o.sphere_overlays.clone(),
             line_overlays: o.line_overlays.clone(),
             grid_box: o.grid_box,
@@ -114,6 +123,10 @@ impl ArchivedRenderOpts {
         let mut residue_highlights = HashMap::with_capacity(self.residue_highlights.len());
         for (c, r, rgb) in self.residue_highlights {
             residue_highlights.insert((c, r), rgb);
+        }
+        let mut residue_colors = HashMap::with_capacity(self.residue_colors.len());
+        for (c, r, rgb) in self.residue_colors {
+            residue_colors.insert((c, r), rgb);
         }
         RenderOptions {
             representation: self.representation,
@@ -130,6 +143,7 @@ impl ArchivedRenderOpts {
             shadow_strength: self.shadow_strength,
             background: self.background,
             residue_highlights,
+            residue_colors,
             sphere_overlays: self.sphere_overlays,
             line_overlays: self.line_overlays,
             grid_box: self.grid_box,
@@ -502,6 +516,9 @@ pub fn decode_session_zip_bytes(
         planes: manifest.planes,
         msa: manifest.msa,
         pae: manifest.pae,
+        ramachandran: None,
+        aggregation: None,
+        rotamer_table: None,
         labels_3d: manifest.labels_3d,
         labels_2d: manifest.labels_2d,
         color_key: manifest.color_key,
