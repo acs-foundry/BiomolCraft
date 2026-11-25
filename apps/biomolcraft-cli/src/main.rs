@@ -818,9 +818,29 @@ fn run() -> Result<(), String> {
                 {
                     std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
                 }
-                std::fs::copy(&asset.local_path, &dest).map_err(|e| e.to_string())?;
+                let src_is_cif = asset
+                    .local_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "cif" | "mmcif"));
+                let dst_is_pdb = dest
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "pdb" | "ent"));
+                let note = if src_is_cif && dst_is_pdb {
+                    let raw = std::fs::read_to_string(&asset.local_path)
+                        .map_err(|e| format!("failed to read cached mmCIF: {e}"))?;
+                    let mol = craftbio_struct::parse_structure_auto(&asset.canonical_id, &raw)
+                        .map_err(|e| format!("mmCIF->PDB parse error: {e}"))?;
+                    let pdb_text = craftbio_struct::write_pdb(&mol);
+                    std::fs::write(&dest, pdb_text.as_bytes()).map_err(|e| e.to_string())?;
+                    format!("converted mmCIF -> PDB at {}", dest.display())
+                } else {
+                    std::fs::copy(&asset.local_path, &dest).map_err(|e| e.to_string())?;
+                    format!("copied to {}", dest.display())
+                };
                 println!(
-                    "Fetched {} {} ({}) -> {} (copied to {})",
+                    "Fetched {} {} ({}) -> {} ({note})",
                     asset.provider,
                     asset.canonical_id,
                     if asset.cached_hit {
@@ -828,8 +848,7 @@ fn run() -> Result<(), String> {
                     } else {
                         "downloaded"
                     },
-                    asset.local_path.display(),
-                    dest.display()
+                    asset.local_path.display()
                 );
             } else {
                 println!(
